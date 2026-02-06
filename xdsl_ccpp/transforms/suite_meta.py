@@ -13,11 +13,11 @@ from xdsl.pattern_rewriter import (
 from xdsl.ir import Block, Region
 from xdsl.rewriter import InsertPoint
 
-from ccpp_dsl.util.visitor import Visitor
-from ccpp_dsl.dialects import ccpp
+from xdsl_ccpp.util.visitor import Visitor
+from xdsl_ccpp.dialects import ccpp
 
-from ccpp_dsl.transforms.util.ccpp_descriptors import CCPPType, CCPPTableProperties, CCPPArgumentTable, CCPPArgument, BuildMetaDataDescriptions
-from ccpp_dsl.transforms.util.typing import TypeConversions
+from xdsl_ccpp.transforms.util.ccpp_descriptors import CCPPType, CCPPTableProperties, CCPPArgumentTable, CCPPArgument, BuildMetaDataDescriptions
+from xdsl_ccpp.transforms.util.typing import TypeConversions
 
 class MoveCCPPIntoDedicatedModule(RewritePattern):
     def __init__(self, dedicated_module):

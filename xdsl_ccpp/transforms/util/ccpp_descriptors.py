@@ -1,7 +1,7 @@
 from enum import Enum, StrEnum, auto
 
-from ccpp_dsl.util.visitor import Visitor
-from ccpp_dsl.dialects import ccpp
+from xdsl_ccpp.util.visitor import Visitor
+from xdsl_ccpp.dialects import ccpp
 
 class CCPPType(StrEnum):
         SCHEME = auto()

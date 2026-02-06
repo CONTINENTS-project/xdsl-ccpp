@@ -3,10 +3,10 @@ import os, glob
 
 from xdsl.dialects.builtin import ModuleOp
 
-from ccpp_dsl.transforms.suite_cap import SuiteCAP
-from ccpp_dsl.transforms.suite_meta import MetaCAP
-from ccpp_dsl.transforms.strip_ccpp import StripCCPP
-from ccpp_dsl.dialects.ccpp import CCPP
+from xdsl_ccpp.transforms.suite_cap import SuiteCAP
+from xdsl_ccpp.transforms.suite_meta import MetaCAP
+from xdsl_ccpp.transforms.strip_ccpp import StripCCPP
+from xdsl_ccpp.dialects.ccpp import CCPP
 
 from pathlib import Path
 
@@ -28,7 +28,7 @@ class CCPPOptMain(xDSLOptMain):
         super().register_all_targets()
 
         def _output_ftn(prog: ModuleOp, output: IO[str]):
-            from ccpp_dsl.backend.print_ftn import print_to_ftn
+            from xdsl_ccpp.backend.print_ftn import print_to_ftn
 
             print_to_ftn(prog, output)
 

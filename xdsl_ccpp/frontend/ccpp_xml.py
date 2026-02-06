@@ -3,7 +3,7 @@ import xml.etree.ElementTree as ET
 from enum import Enum, StrEnum, auto
 from xdsl.dialects.builtin import ModuleOp
 
-from ccpp_dsl.dialects.ccpp import SuiteOp, GroupOp, SchemeOp, TablePropertiesOp, ArgumentTableOp, ArgumentOp
+from xdsl_ccpp.dialects.ccpp import SuiteOp, GroupOp, SchemeOp, TablePropertiesOp, ArgumentTableOp, ArgumentOp
 
 class CCPPType(StrEnum):
         SCHEME = auto()
