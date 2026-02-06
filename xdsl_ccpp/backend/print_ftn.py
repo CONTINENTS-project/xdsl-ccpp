@@ -244,6 +244,8 @@ class ftnPrintContext:
 
     def print_op(self, op: Operation):
         match op:
+            case builtin.ModuleOp(sym_name=name, body=bdy):
+                self._print_module(name, bdy)
             case memref.AllocaOp(memref=arr):
                 possible_ret=list(arr.uses)[0].operation
                 if isa(possible_ret, func.ReturnOp):
@@ -268,6 +270,20 @@ class ftnPrintContext:
                     self.print(f"{arr_name} = ", end="")
                 self.print_expr(val.owner)
                 self.print("")
+
+    def _print_module(self, module_name, body):
+        assert module_name is not None
+
+        self.print(f"module {module_name.data}")
+        self.print("\nuse ccpp_kinds", prefix="  ")
+        self.print("\nimplicit none", prefix="  ")
+        self.print("private", prefix="  ")
+        self.print("\nCONTAINS")
+
+        with self.descend() as inner:
+            inner.print_block(body)
+
+        self.print(f"end module {module_name.data}")
 
     def get_call_result_var_ssa(self, res_ssa):
         for use in res_ssa.uses:
@@ -404,5 +420,5 @@ def print_to_ftn(
         if divider:
             ctx.print("// -----")
         divider = True
-        ctx.print("// FILE: " + module.sym_name.data)
-        ctx.print_block(module.body.block)
+        ctx.print("// FILE: " + module.sym_name.data+".F90")
+        ctx.print_op(module)
