@@ -106,7 +106,15 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         return [err_const_comp, cmp, load_op, conditional_op]
 
-    def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None):
+    def generateStateAssignment(self, state_string: str):
+        data = state_string.encode().ljust(16, b"\x00")
+        arr_type = llvm.LLVMArrayType.from_size_and_type(16, i8)
+        addr = llvm.AddressOfOp("ccpp_suite_state", llvm.LLVMPointerType())
+        val = llvm.ConstantOp(DenseIntOrFPElementsAttr(TensorType(i8, [16]), BytesAttr(data)), arr_type)
+        store = llvm.StoreOp(val, addr)
+        return [addr, val, store]
+
+    def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None, state_string: str | None = None):
         if generated_subroutine_posfix is None:
             generated_subroutine_posfix=tgt_subroutine_postfix
 
@@ -162,7 +170,9 @@ class GenerateSuiteSubroutine(RewritePattern):
         inout_return_vals=[data_ops[a.name] for a in input_arg_list if a.getAttr("intent") == "inout"]
         alloc_return_vals=list(alloc_ops.values())
 
-        body_ops=alloc_return_vals+initialisation_ops+call_ops+[func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
+        state_ops=self.generateStateAssignment(state_string) if state_string is not None else []
+
+        body_ops=alloc_return_vals+initialisation_ops+call_ops+state_ops+[func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
 
         new_block.add_ops(body_ops)
         body=Region()
@@ -190,8 +200,8 @@ class GenerateSuiteSubroutine(RewritePattern):
     def match_and_rewrite(self, op: ccpp.SuiteOp, rewriter: PatternRewriter):
         suite_description=self.suite_descriptions[op.suite_name.data]
 
-        init_fn, init_fn_sigs=self.generateSubroutineCall(suite_description, "_init", "_initialize")
-        finalise_fn, finalise_fn_sigs=self.generateSubroutineCall(suite_description, "_finalize")
+        init_fn, init_fn_sigs=self.generateSubroutineCall(suite_description, "_init", "_initialize", state_string="initialized")
+        finalise_fn, finalise_fn_sigs=self.generateSubroutineCall(suite_description, "_finalize", state_string="uninitialized")
         physics_fn, physics_fn_sigs=self.generateSubroutineCall(suite_description, "_run", "_physics")
 
         fn_sigs=self.clone_func_defs(init_fn_sigs, finalise_fn_sigs, physics_fn_sigs)
@@ -201,7 +211,6 @@ class GenerateSuiteSubroutine(RewritePattern):
             llvm.LLVMArrayType.from_size_and_type(16, i8),
             "ccpp_suite_state",
             "internal",
-            constant=True,
             value=DenseIntOrFPElementsAttr(TensorType(i8, [16]), BytesAttr(ccpp_suite_state_data)),
         )
 
