@@ -11,7 +11,7 @@ from xdsl.pattern_rewriter import (
     InsertPoint,
     op_type_rewrite_pattern,
 )
-from xdsl.ir import Block, Region
+from xdsl.ir import Block, Region, SSAValue
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.util.visitor import Visitor
@@ -83,11 +83,13 @@ class GenerateSuiteSubroutine(RewritePattern):
         out_types=[]
         out_tracking=[]
         for arg in arg_table.getFunctionArguments():
-            if arg.getAttr("intent") == "in" or arg.getAttr("intent") == "inout":
+            intent = arg.getAttr("intent")
+            if intent == "in" or intent == "inout":
                 in_ssa.append(data_ops[arg.name])
-            elif arg.getAttr("intent") == "out":
-                out_types.append(data_ops[arg.name].results[0].type)
-                out_tracking.append(data_ops[arg.name])
+            if intent == "out" or intent == "inout":
+                val = data_ops[arg.name]
+                out_types.append(val.type if isinstance(val, SSAValue) else val.results[0].type)
+                out_tracking.append(val)
 
         assert len(out_types) == len(out_tracking)
         call_op=func.CallOp(subroutine_name, in_ssa, out_types)
@@ -112,29 +114,60 @@ class GenerateSuiteSubroutine(RewritePattern):
         for scheme_name in scheme_names:
             arg_tables[scheme_name]=self.getArgumentTable(scheme_name, scheme_name+tgt_subroutine_postfix)
 
-        input_arg_types=[]
+        # Collect unique args across all schemes, preserving first-seen order
+        all_args={}
+        for scheme_name in scheme_names:
+            for fn_arg in arg_tables[scheme_name].getFunctionArguments():
+                if fn_arg.name in all_args:
+                    assert fn_arg.getAttr("type") == all_args[fn_arg.name].getAttr("type")
+                else:
+                    all_args[fn_arg.name]=fn_arg
+
+        # in/inout args become block arguments (input parameters to the cap subroutine)
+        # out-only args are allocated locally
+        input_arg_list=[a for a in all_args.values() if a.getAttr("intent") in ("in", "inout")]
+        output_arg_list=[a for a in all_args.values() if a.getAttr("intent") == "out"]
+
+        input_arg_types=[TypeConversions.convert(a.getAttr("type"), a.getAttr("kind") if a.hasAttr("kind") else None)
+                         for a in input_arg_list]
 
         new_block=Block(arg_types=input_arg_types)
 
-        create_data_ops=self.generateVariableCreation(scheme_names, arg_tables)
+        data_ops={}
+        for idx, fn_arg in enumerate(input_arg_list):
+            data_ops[fn_arg.name]=new_block.args[idx]
 
-        initialisation_ops=self.generateVariableInitialisations(create_data_ops)
+        alloc_ops={}
+        for fn_arg in output_arg_list:
+            arg_type=fn_arg.getAttr("type")
+            data_shape=[]
+            if arg_type=="character":
+                data_shape.append(int(fn_arg.getAttr("kind").split("=")[1]))
+            alloc_op=memref.AllocaOp.get(TypeConversions.getBaseType(arg_type), shape=data_shape)
+            alloc_ops[fn_arg.name]=alloc_op
+            data_ops[fn_arg.name]=alloc_op
+
+        initialisation_ops=self.generateVariableInitialisations(data_ops)
 
         call_ops=[]
         fn_sigs={}
         for scheme_name in scheme_names:
             assert scheme_name+tgt_subroutine_postfix in self.meta_fn_sigs
-            call_ops+=self.generateSchemeSubroutineCallOps(scheme_name+tgt_subroutine_postfix, arg_tables[scheme_name], create_data_ops)
+            call_ops+=self.generateSchemeSubroutineCallOps(scheme_name+tgt_subroutine_postfix, arg_tables[scheme_name], data_ops)
             if scheme_name+tgt_subroutine_postfix not in fn_sigs:
                 fn_sigs[scheme_name+tgt_subroutine_postfix]=self.meta_fn_sigs[scheme_name+tgt_subroutine_postfix]
 
-        body_ops=list(create_data_ops.values())+initialisation_ops+call_ops+[func.ReturnOp(*list(create_data_ops.values()))]
+        # inout block args are also returned (they are both inputs and outputs)
+        inout_return_vals=[data_ops[a.name] for a in input_arg_list if a.getAttr("intent") == "inout"]
+        alloc_return_vals=list(alloc_ops.values())
+
+        body_ops=alloc_return_vals+initialisation_ops+call_ops+[func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
 
         new_block.add_ops(body_ops)
         body=Region()
         body.add_block(new_block)
 
-        return_types=[o.results[0].type for o in create_data_ops.values()]
+        return_types=[v.type for v in inout_return_vals]+[o.results[0].type for o in alloc_return_vals]
 
         new_fn_type = builtin.FunctionType.from_lists(input_arg_types, return_types)
         new_func=func.FuncOp(
@@ -158,10 +191,11 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         init_fn, init_fn_sigs=self.generateSubroutineCall(suite_description, "_init", "_initialize")
         finalise_fn, finalise_fn_sigs=self.generateSubroutineCall(suite_description, "_finalize")
+        physics_fn, physics_fn_sigs=self.generateSubroutineCall(suite_description, "_run", "_physics")
 
-        fn_sigs=self.clone_func_defs(init_fn_sigs, finalise_fn_sigs)
+        fn_sigs=self.clone_func_defs(init_fn_sigs, finalise_fn_sigs, physics_fn_sigs)
 
-        scheme_mod=builtin.ModuleOp([init_fn, finalise_fn]+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
+        scheme_mod=builtin.ModuleOp([init_fn, finalise_fn, physics_fn]+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
 
         rewriter.insert_op(scheme_mod, InsertPoint.at_start(self.top_level_module.body.block))
 
