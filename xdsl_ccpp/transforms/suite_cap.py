@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
-from xdsl.dialects import builtin, memref, func, arith, scf
+from xdsl.dialects import builtin, memref, func, arith, scf, llvm
+from xdsl.dialects.builtin import DenseIntOrFPElementsAttr, TensorType, i8, BytesAttr
 from xdsl.context import Context
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -195,7 +196,16 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         fn_sigs=self.clone_func_defs(init_fn_sigs, finalise_fn_sigs, physics_fn_sigs)
 
-        scheme_mod=builtin.ModuleOp([init_fn, finalise_fn, physics_fn]+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
+        ccpp_suite_state_data = b"uninitialized\x00\x00\x00"  # 16 bytes
+        ccpp_suite_state_global = llvm.GlobalOp(
+            llvm.LLVMArrayType.from_size_and_type(16, i8),
+            "ccpp_suite_state",
+            "internal",
+            constant=True,
+            value=DenseIntOrFPElementsAttr(TensorType(i8, [16]), BytesAttr(ccpp_suite_state_data)),
+        )
+
+        scheme_mod=builtin.ModuleOp([ccpp_suite_state_global, init_fn, finalise_fn, physics_fn]+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
 
         rewriter.insert_op(scheme_mod, InsertPoint.at_start(self.top_level_module.body.block))
 
