@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from xdsl.dialects import builtin, memref, func, arith, scf, llvm
-from xdsl.dialects.builtin import DenseIntOrFPElementsAttr, TensorType, i8, BytesAttr
+from xdsl.dialects.builtin import i8, DenseArrayBase, i64, StringAttr
 from xdsl.context import Context
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -18,7 +18,7 @@ from xdsl.utils.hints import isa
 from xdsl_ccpp.util.visitor import Visitor
 from xdsl_ccpp.dialects import ccpp
 
-from xdsl_ccpp.transforms.util.ccpp_descriptors import CCPPType, CCPPTableProperties, CCPPArgumentTable, CCPPArgument, XMLSuiteBase, XMLScheme, XMLGroup, XMLSuite, BuildMetaDataDescriptions, BuildSchemeDescription
+from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription
 from xdsl_ccpp.transforms.util.typing import TypeConversions
 
 class GatherMetaFunctionSignatures(Visitor):
@@ -106,15 +106,63 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         return [err_const_comp, cmp, load_op, conditional_op]
 
-    def generateStateAssignment(self, state_string: str):
-        data = state_string.encode().ljust(16, b"\x00")
-        arr_type = llvm.LLVMArrayType.from_size_and_type(16, i8)
-        addr = llvm.AddressOfOp("ccpp_suite_state", llvm.LLVMPointerType())
-        val = llvm.ConstantOp(DenseIntOrFPElementsAttr(TensorType(i8, [16]), BytesAttr(data)), arr_type)
-        store = llvm.StoreOp(val, addr)
-        return [addr, val, store]
+    def generateStateAssignmentGlobal(self, state_string: str) -> llvm.GlobalOp:
+        return llvm.GlobalOp(
+            llvm.LLVMArrayType.from_size_and_type(16, i8),
+            "ccpp_assign_" + state_string,
+            "internal",
+            constant=True,
+            value=StringAttr(state_string),
+        )
 
-    def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None, state_string: str | None = None):
+    def generateStateConstantGlobal(self, check_string: str) -> llvm.GlobalOp:
+        return llvm.GlobalOp(
+            llvm.LLVMArrayType.from_size_and_type(16, i8),
+            "ccpp_state_" + check_string,
+            "internal",
+            constant=True,
+            value=StringAttr(check_string),
+        )
+
+    def generateStateCheckOps(self, check_string: str, data_ops):
+        arr_type = llvm.LLVMArrayType.from_size_and_type(16, i8)
+
+        addr_const = llvm.AddressOfOp("ccpp_state_" + check_string, llvm.LLVMPointerType())
+        loaded_const = llvm.LoadOp(addr_const, arr_type)
+        addr_state = llvm.AddressOfOp("ccpp_suite_state", llvm.LLVMPointerType())
+        loaded_state = llvm.LoadOp(addr_state, arr_type)
+
+        ops = [addr_const, loaded_const, addr_state, loaded_state]
+
+        prev = None
+        for idx in range(len(check_string)):
+            const_byte = llvm.ExtractValueOp(DenseArrayBase.from_list(i64, [idx]), loaded_const, i8)
+            state_byte = llvm.ExtractValueOp(DenseArrayBase.from_list(i64, [idx]), loaded_state, i8)
+            cmp = arith.CmpiOp(state_byte.res, const_byte.res, 1)  # 1 = ne
+            ops += [const_byte, state_byte, cmp]
+            if prev is None:
+                prev = cmp
+            else:
+                or_op = arith.OrIOp(prev.result, cmp.result)
+                ops.append(or_op)
+                prev = or_op
+
+        one = arith.ConstantOp.from_int_and_width(1, 32)
+        store = memref.StoreOp.get(one, data_ops["errflg"], [])
+        if_op = scf.IfOp(prev.result, [], [one, store, scf.YieldOp()])
+        ops.append(if_op)
+
+        return ops
+
+    def generateStateAssignment(self, state_string: str):
+        arr_type = llvm.LLVMArrayType.from_size_and_type(16, i8)
+        addr_src = llvm.AddressOfOp("ccpp_assign_" + state_string, llvm.LLVMPointerType())
+        loaded = llvm.LoadOp(addr_src, arr_type)
+        addr_dst = llvm.AddressOfOp("ccpp_suite_state", llvm.LLVMPointerType())
+        store = llvm.StoreOp(loaded, addr_dst)
+        return [addr_src, loaded, addr_dst, store]
+
+    def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None, state_string: str | None = None, check_string: str | None = None):
         if generated_subroutine_posfix is None:
             generated_subroutine_posfix=tgt_subroutine_postfix
 
@@ -170,9 +218,10 @@ class GenerateSuiteSubroutine(RewritePattern):
         inout_return_vals=[data_ops[a.name] for a in input_arg_list if a.getAttr("intent") == "inout"]
         alloc_return_vals=list(alloc_ops.values())
 
+        check_ops=self.generateStateCheckOps(check_string, data_ops) if check_string is not None else []
         state_ops=self.generateStateAssignment(state_string) if state_string is not None else []
 
-        body_ops=alloc_return_vals+initialisation_ops+call_ops+state_ops+[func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
+        body_ops=alloc_return_vals+initialisation_ops+check_ops+call_ops+state_ops+[func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
 
         new_block.add_ops(body_ops)
         body=Region()
@@ -202,19 +251,24 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         init_fn, init_fn_sigs=self.generateSubroutineCall(suite_description, "_init", "_initialize", state_string="initialized")
         finalise_fn, finalise_fn_sigs=self.generateSubroutineCall(suite_description, "_finalize", state_string="uninitialized")
-        physics_fn, physics_fn_sigs=self.generateSubroutineCall(suite_description, "_run", "_physics")
+        physics_fn, physics_fn_sigs=self.generateSubroutineCall(suite_description, "_run", "_physics", check_string="initialized")
 
         fn_sigs=self.clone_func_defs(init_fn_sigs, finalise_fn_sigs, physics_fn_sigs)
 
-        ccpp_suite_state_data = b"uninitialized\x00\x00\x00"  # 16 bytes
         ccpp_suite_state_global = llvm.GlobalOp(
             llvm.LLVMArrayType.from_size_and_type(16, i8),
             "ccpp_suite_state",
             "internal",
-            value=DenseIntOrFPElementsAttr(TensorType(i8, [16]), BytesAttr(ccpp_suite_state_data)),
+            value=StringAttr("uninitialized"),
         )
 
-        scheme_mod=builtin.ModuleOp([ccpp_suite_state_global, init_fn, finalise_fn, physics_fn]+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
+        check_strings_used = {cs for cs in [None, None, "initialized"] if cs is not None}
+        state_const_globals = [self.generateStateConstantGlobal(cs) for cs in sorted(check_strings_used)]
+
+        state_strings_used = {"initialized", "uninitialized"}
+        state_assign_globals = [self.generateStateAssignmentGlobal(ss) for ss in sorted(state_strings_used)]
+
+        scheme_mod=builtin.ModuleOp([ccpp_suite_state_global]+state_const_globals+state_assign_globals+[init_fn, finalise_fn, physics_fn]+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
 
         rewriter.insert_op(scheme_mod, InsertPoint.at_start(self.top_level_module.body.block))
 
