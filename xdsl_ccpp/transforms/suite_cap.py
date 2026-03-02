@@ -19,7 +19,7 @@ from xdsl_ccpp.util.visitor import Visitor
 from xdsl_ccpp.dialects import ccpp
 from xdsl_ccpp.dialects import ccpp_utils
 
-from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription
+from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPArgument
 from xdsl_ccpp.transforms.util.typing import TypeConversions
 
 
@@ -189,7 +189,7 @@ class GenerateSuiteSubroutine(RewritePattern):
         store = llvm.StoreOp(loaded, addr_dst)
         return [addr_src, loaded, addr_dst, store]
 
-    def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None, state_string: str | None = None, check_string: str | None = None):
+    def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None, state_string: str | None = None, check_string: str | None = None, physics_mode: bool = False):
         """Build a single cap subroutine as a func.FuncOp.
 
         tgt_subroutine_postfix  -- suffix appended to each scheme name to form
@@ -235,6 +235,36 @@ class GenerateSuiteSubroutine(RewritePattern):
         output_arg_list = [a for a in all_args.values()
                            if a.getAttr("intent") == "out" and not _has_dims(a)]
 
+        loop_ext_aliases: set = set()
+        if physics_mode and any(a.name == "ncol" for a in input_arg_list):
+            ncol_meta = next(a for a in input_arg_list if a.name == "ncol")
+            ncol_idx = next(i for i, a in enumerate(input_arg_list) if a.name == "ncol")
+
+            # Collect other args sharing ncol's standard_name (e.g. 'nbox' in
+            # temp_adjust_run also has standard_name = horizontal_loop_extent).
+            # These are aliases for the column count and should not become block args.
+            ncol_std_name = ncol_meta.getAttr("standard_name") if ncol_meta.hasAttr("standard_name") else None
+            loop_ext_aliases = {
+                a.name for a in input_arg_list
+                if a.name != "ncol" and ncol_std_name
+                and a.hasAttr("standard_name") and a.getAttr("standard_name") == ncol_std_name
+            }
+
+            def _make_col_arg(name):
+                a = CCPPArgument(name)
+                a.setAttr("type", ncol_meta.getAttr("type"))
+                a.setAttr("intent", "in")
+                if ncol_meta.hasAttr("kind"):
+                    a.setAttr("kind", ncol_meta.getAttr("kind"))
+                a.setAttr("dimensions", 0)
+                return a
+
+            input_arg_list = (
+                input_arg_list[:ncol_idx]
+                + [_make_col_arg("col_start"), _make_col_arg("col_end")]
+                + [a for a in input_arg_list[ncol_idx + 1:] if a.name not in loop_ext_aliases]
+            )
+
         input_arg_types = [
             TypeConversions.convert(
                 a.getAttr("type"),
@@ -277,6 +307,21 @@ class GenerateSuiteSubroutine(RewritePattern):
             alloc_ops["errmsg"] = alloc_op
             data_ops["errmsg"] = alloc_op
 
+        ncol_compute_ops = []
+        if physics_mode and "col_start" in data_ops and "col_end" in data_ops:
+            ncol_alloc = memref.AllocaOp.get(TypeConversions.getBaseType("integer"), shape=[])
+            ncol_alloc.memref.name_hint = "ncol"
+            load_col_start = memref.LoadOp.get(data_ops["col_start"], [])
+            load_col_end = memref.LoadOp.get(data_ops["col_end"], [])
+            sub_op = arith.SubiOp(load_col_end, load_col_start)
+            one_const = arith.ConstantOp.from_int_and_width(1, 32)
+            add_op = arith.AddiOp(sub_op, one_const)
+            store_ncol = memref.StoreOp.get(add_op, ncol_alloc, [])
+            data_ops["ncol"] = ncol_alloc
+            for alias in loop_ext_aliases:
+                data_ops[alias] = ncol_alloc
+            ncol_compute_ops = [ncol_alloc, load_col_start, load_col_end, sub_op, one_const, add_op, store_ncol]
+
         initialisation_ops = self.generateVariableInitialisations(data_ops)
 
         call_ops = []
@@ -301,7 +346,7 @@ class GenerateSuiteSubroutine(RewritePattern):
         check_ops = self.generateStateCheckOps(check_string, data_ops) if check_string is not None else []
         state_ops = self.generateStateAssignment(state_string) if state_string is not None else []
 
-        body_ops = alloc_return_vals + initialisation_ops + check_ops + call_ops + state_ops + [func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
+        body_ops = alloc_return_vals + initialisation_ops + ncol_compute_ops + check_ops + call_ops + state_ops + [func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
 
         new_block.add_ops(body_ops)
         body = Region()
@@ -364,6 +409,7 @@ class GenerateSuiteSubroutine(RewritePattern):
             fn, sigs = self.generateSubroutineCall(
                 suite_description, tgt_postfix, gen_postfix,
                 state_string=state_string, check_string=check_string,
+                physics_mode=(tgt_postfix == "_run"),
             )
             generated_fns.append(fn)
             # Deduplicate scheme function signatures by name

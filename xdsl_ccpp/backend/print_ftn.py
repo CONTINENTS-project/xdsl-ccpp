@@ -308,6 +308,14 @@ class ftnPrintContext:
                 lhs_name = self._get_variable_name_for(op.lhs)
                 literal_val = op.literal.data
                 self.print(f"trim({lhs_name}) .eq. '{literal_val}'", end="", use_prefix=False)
+            case arith.AddiOp():
+                self.print_expr(op.lhs.owner)
+                self.print(" + ", end="", use_prefix=False)
+                self.print_expr(op.rhs.owner)
+            case arith.SubiOp():
+                self.print_expr(op.lhs.owner)
+                self.print(" - ", end="", use_prefix=False)
+                self.print_expr(op.rhs.owner)
             case _:
                 print(type(op))
                 assert False
@@ -531,6 +539,12 @@ class ftnPrintContext:
                         inout_block_args.add(ret_val)
                 break
 
+        # Collect local allocas — AllocaOps whose result is not in the return list
+        local_allocas = [
+            op for op in bdy.block.ops
+            if isa(op, memref.AllocaOp) and op.memref not in output_ret_vals
+        ]
+
         args_str = ", ".join(input_names + output_names)
         start_signature = f"\nsubroutine {fn_name.data}({args_str})"
         end_signature = f"end subroutine {fn_name.data}"
@@ -563,6 +577,13 @@ class ftnPrintContext:
                 type_str = inner.mlir_type_to_ftn_type(ret_val.type)
                 dim_suffix = inner._ftn_dim_suffix(ret_val.type)
                 inner.print(f"{type_str}, intent(out) :: {out_name}{dim_suffix}")
+
+            # Declare local variables (non-returned allocas, e.g. computed scalars)
+            for alloca_op in local_allocas:
+                var_name = alloca_op.memref.name_hint if alloca_op.memref.name_hint is not None else f"local_{id(alloca_op)}"
+                inner.variables[alloca_op.memref] = var_name
+                type_str = inner.mlir_type_to_ftn_type(alloca_op.memref.type)
+                inner.print(f"{type_str} :: {var_name}")
 
             inner.print("")
 

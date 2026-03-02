@@ -291,11 +291,10 @@ class CCPPCAP(ModulePass):
         suite_part_arg = new_block.args[1]
         suite_part_arg.name_hint = "suite_part"
 
-        _run_arg_rename = {"ncol": "col_start", "nbox": "col_end"}
         block_arg_map = {}
         for i, (arg_name, _) in enumerate(non_host_args):
             ba = new_block.args[2 + i]
-            ba.name_hint = _run_arg_rename.get(arg_name, arg_name)
+            ba.name_hint = arg_name
             block_arg_map[arg_name] = ba
 
         errmsg_arg = new_block.args[2 + n_non_host]
