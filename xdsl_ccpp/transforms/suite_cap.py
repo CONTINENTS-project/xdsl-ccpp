@@ -146,21 +146,24 @@ class GenerateSuiteSubroutine(RewritePattern):
 
     def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None, state_string: str | None = None, check_string: str | None = None):
         if generated_subroutine_posfix is None:
+            assert tgt_subroutine_postfix is not None
             generated_subroutine_posfix=tgt_subroutine_postfix
+
 
         scheme_names=self.getSchemeNames(suite_description)
         arg_tables={}
-        for scheme_name in scheme_names:
-            arg_tables[scheme_name]=self.getArgumentTable(scheme_name, scheme_name+tgt_subroutine_postfix)
+        all_args={}
+        if tgt_subroutine_postfix is not None:
+            for scheme_name in scheme_names:
+                arg_tables[scheme_name]=self.getArgumentTable(scheme_name, scheme_name+tgt_subroutine_postfix)
 
         # Collect unique args across all schemes, preserving first-seen order
-        all_args={}
-        for scheme_name in scheme_names:
-            for fn_arg in arg_tables[scheme_name].getFunctionArguments():
-                if fn_arg.name in all_args:
-                    assert fn_arg.getAttr("type") == all_args[fn_arg.name].getAttr("type")
-                else:
-                    all_args[fn_arg.name]=fn_arg
+            for scheme_name in scheme_names:
+                for fn_arg in arg_tables[scheme_name].getFunctionArguments():
+                    if fn_arg.name in all_args:
+                        assert fn_arg.getAttr("type") == all_args[fn_arg.name].getAttr("type")
+                    else:
+                        all_args[fn_arg.name]=fn_arg
 
         # in/inout args become block arguments (input parameters to the cap subroutine)
         # out-only args are allocated locally
@@ -186,15 +189,27 @@ class GenerateSuiteSubroutine(RewritePattern):
             alloc_ops[fn_arg.name]=alloc_op
             data_ops[fn_arg.name]=alloc_op
 
+        # errflg and errmsg must always be present regardless of whether scheme
+        # functions are called (e.g. when tgt_subroutine_postfix is None)
+        if "errflg" not in data_ops:
+            alloc_op=memref.AllocaOp.get(TypeConversions.getBaseType("integer"), shape=[])
+            alloc_ops["errflg"]=alloc_op
+            data_ops["errflg"]=alloc_op
+        if "errmsg" not in data_ops:
+            alloc_op=memref.AllocaOp.get(TypeConversions.getBaseType("character"), shape=[512])
+            alloc_ops["errmsg"]=alloc_op
+            data_ops["errmsg"]=alloc_op
+
         initialisation_ops=self.generateVariableInitialisations(data_ops)
 
         call_ops=[]
         fn_sigs={}
-        for scheme_name in scheme_names:
-            assert scheme_name+tgt_subroutine_postfix in self.meta_fn_sigs
-            call_ops+=self.generateSchemeSubroutineCallOps(scheme_name+tgt_subroutine_postfix, arg_tables[scheme_name], data_ops)
-            if scheme_name+tgt_subroutine_postfix not in fn_sigs:
-                fn_sigs[scheme_name+tgt_subroutine_postfix]=self.meta_fn_sigs[scheme_name+tgt_subroutine_postfix]
+        if tgt_subroutine_postfix is not None:
+            for scheme_name in scheme_names:
+                assert scheme_name+tgt_subroutine_postfix in self.meta_fn_sigs
+                call_ops+=self.generateSchemeSubroutineCallOps(scheme_name+tgt_subroutine_postfix, arg_tables[scheme_name], data_ops)
+                if scheme_name+tgt_subroutine_postfix not in fn_sigs:
+                    fn_sigs[scheme_name+tgt_subroutine_postfix]=self.meta_fn_sigs[scheme_name+tgt_subroutine_postfix]
 
         # inout block args are also returned (they are both inputs and outputs)
         inout_return_vals=[data_ops[a.name] for a in input_arg_list if a.getAttr("intent") == "inout"]
@@ -234,7 +249,9 @@ class GenerateSuiteSubroutine(RewritePattern):
         subroutine_specs = [
             ("_init",     "_initialize", "initialized",  "uninitialized"),
             ("_finalize", None,          "uninitialized", "initialized"),
-            ("_run",      "_physics",    None,            "initialized"),
+            ("_run",      "_physics",    None,            "in_time_step"),
+            (None,      "_timestep_initial",    "in_time_step",    "initialized"),
+            (None,      "_timestep_final",    "initialized",    "in_time_step"),
         ]
 
         generated_fns = []
