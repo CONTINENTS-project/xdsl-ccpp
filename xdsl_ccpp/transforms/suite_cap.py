@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from xdsl.dialects import builtin, memref, func, arith, scf, llvm
-from xdsl.dialects.builtin import i8, DenseArrayBase, i64, StringAttr
+from xdsl.dialects.builtin import i8, StringAttr
 from xdsl.context import Context
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -17,6 +17,7 @@ from xdsl.utils.hints import isa
 
 from xdsl_ccpp.util.visitor import Visitor
 from xdsl_ccpp.dialects import ccpp
+from xdsl_ccpp.dialects import ccpp_utils
 
 from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription
 from xdsl_ccpp.transforms.util.typing import TypeConversions
@@ -132,27 +133,17 @@ class GenerateSuiteSubroutine(RewritePattern):
         addr_state = llvm.AddressOfOp("ccpp_suite_state", llvm.LLVMPointerType())
         loaded_state = llvm.LoadOp(addr_state, arr_type)
 
-        ops = [addr_const, loaded_const, addr_state, loaded_state]
+        strcmp_op = ccpp_utils.StrCmpOp(loaded_const, loaded_state, len(check_string))
 
-        prev = None
-        for idx in range(len(check_string)):
-            const_byte = llvm.ExtractValueOp(DenseArrayBase.from_list(i64, [idx]), loaded_const, i8)
-            state_byte = llvm.ExtractValueOp(DenseArrayBase.from_list(i64, [idx]), loaded_state, i8)
-            cmp = arith.CmpiOp(state_byte.res, const_byte.res, 1)  # 1 = ne
-            ops += [const_byte, state_byte, cmp]
-            if prev is None:
-                prev = cmp
-            else:
-                or_op = arith.OrIOp(prev.result, cmp.result)
-                ops.append(or_op)
-                prev = or_op
+        # strcmp returns 1 if equal; negate to get mismatch flag for scf.if
+        one_i1 = arith.ConstantOp.from_int_and_width(1, 1)
+        mismatch = arith.XOrIOp(strcmp_op.res, one_i1.result)
 
         one = arith.ConstantOp.from_int_and_width(1, 32)
         store = memref.StoreOp.get(one, data_ops["errflg"], [])
-        if_op = scf.IfOp(prev.result, [], [one, store, scf.YieldOp()])
-        ops.append(if_op)
+        if_op = scf.IfOp(mismatch.result, [], [one, store, scf.YieldOp()])
 
-        return ops
+        return [addr_const, loaded_const, addr_state, loaded_state, strcmp_op, one_i1, mismatch, if_op]
 
     def generateStateAssignment(self, state_string: str):
         arr_type = llvm.LLVMArrayType.from_size_and_type(16, i8)
