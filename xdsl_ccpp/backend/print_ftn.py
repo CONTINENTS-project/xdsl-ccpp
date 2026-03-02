@@ -6,7 +6,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
-from xdsl.dialects import arith, csl, memref, scf, builtin, func
+from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
+from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -169,12 +170,14 @@ class ftnPrintContext:
                     raise ValueError(
                         "Can't print memrefs to ftn if they have dynamic sizes. "
                     )
-                shape = ", ".join(str(s.data) for s in shape)
-                type = self.mlir_type_to_ftn_type(elem_t)
-                if type == "character":
-                    return f"{type}(len={shape})"
+                shape_str = ", ".join(str(s.data) for s in shape)
+                type_str = self.mlir_type_to_ftn_type(elem_t)
+                if not shape_str:
+                    return type_str
+                elif type_str == "character":
+                    return f"{type_str}(len={shape_str})"
                 else:
-                    return f"{type}({shape})"
+                    return f"{type_str}({shape_str})"
 
     def attribute_value_to_str(self, attr: Attribute) -> str:
         """
@@ -238,6 +241,24 @@ class ftnPrintContext:
                 self.print_expr(l.owner)
                 self.print(f" {self._cmp_ops[op.name][str_pred]} ", end="", use_prefix=False)
                 self.print_expr(r.owner)
+            case arith.XOrIOp():
+                l, r = op.lhs, op.rhs
+                if isa(r.owner, arith.ConstantOp):
+                    self.print(".NOT. (", end="", use_prefix=False)
+                    self.print_expr(l.owner)
+                    self.print(")", end="", use_prefix=False)
+                elif isa(l.owner, arith.ConstantOp):
+                    self.print(".NOT. (", end="", use_prefix=False)
+                    self.print_expr(r.owner)
+                    self.print(")", end="", use_prefix=False)
+                else:
+                    self.print_expr(l.owner)
+                    self.print(" .neqv. ", end="", use_prefix=False)
+                    self.print_expr(r.owner)
+            case CCPPStrCmpOp():
+                lhs_name = self._get_variable_name_for(op.lhs)
+                rhs_name = self._get_variable_name_for(op.rhs)
+                self.print(f"{lhs_name} .eq. {rhs_name}", end="", use_prefix=False)
             case _:
                 print(type(op))
                 assert False
@@ -246,12 +267,18 @@ class ftnPrintContext:
         match op:
             case builtin.ModuleOp(sym_name=name, body=bdy):
                 self._print_module(name, bdy)
-            case memref.AllocaOp(memref=arr):
-                possible_ret=list(arr.uses)[0].operation
-                if isa(possible_ret, func.ReturnOp):
-                    arg_idx=self.find_ret_ssa_idx(possible_ret, arr)
-                    assert arg_idx is not None
-                    self.variables[arr]="arg_"+str(arg_idx)
+            case memref.AllocaOp():
+                pass  # Registration handled in _print_fn
+            case llvm.GlobalOp():
+                pass  # Declarations handled in _print_module
+            case llvm.AddressOfOp():
+                self.variables[op.result] = op.global_name.root_reference.data
+            case llvm.LoadOp():
+                self.variables[op.dereferenced_value] = self._get_variable_name_for(op.ptr)
+            case llvm.StoreOp():
+                dst_name = self._get_variable_name_for(op.ptr)
+                src_name = self._get_variable_name_for(op.value)
+                self.print(f"{dst_name} = {src_name}")
             case func.FuncOp(sym_name=name, body=bdy, function_type=ftyp):
                 if not op.is_declaration:
                     self._print_fn(name, bdy, ftyp)
@@ -278,6 +305,18 @@ class ftnPrintContext:
         self.print("\nuse ccpp_kinds", prefix="  ")
         self.print("\nimplicit none", prefix="  ")
         self.print("private", prefix="  ")
+        self.print("")
+
+        for op in body.ops:
+            if isa(op, llvm.GlobalOp):
+                name = op.sym_name.data
+                val = op.value.data if isa(op.value, StringAttr) else ""
+                is_const = op.constant is not None
+                if is_const:
+                    self.print(f"character(len=16), parameter :: {name} = '{val}'", prefix="  ")
+                else:
+                    self.print(f"character(len=16) :: {name} = '{val}'", prefix="  ")
+
         self.print("\nCONTAINS")
 
         with self.descend() as inner:
@@ -294,7 +333,7 @@ class ftnPrintContext:
         self.print(f"call {tgt.string_value()}(", end="")
         for idx, arg in enumerate(args):
             if idx > 0: self.print(", ", end="", use_prefix=False)
-            self.print_expr(arg.owner)
+            self.print(self._get_variable_name_for(arg), end="", use_prefix=False)
 
         for idx, res in enumerate(results, start=len(args)):
             if idx > 0: self.print(", ", end="", use_prefix=False)
@@ -343,10 +382,23 @@ class ftnPrintContext:
         start_signature = f"\nsubroutine {name.data}({args})"
         end_signature = f"end subroutine {name.data}"
         with self.descend(start_signature, end_signature) as inner:
+            # Register block args (in/inout args) as arg_0, arg_1, ...
+            for idx, arg in enumerate(bdy.block.args):
+                inner.variables[arg] = f"arg_{idx}"
+
+            # Register alloca results (out args) by scanning ReturnOp
+            n_inputs = len(ftyp.inputs.data)
+            for op in bdy.block.ops:
+                if isa(op, func.ReturnOp):
+                    for ret_idx, ret_val in enumerate(op.arguments):
+                        if isa(ret_val.owner, memref.AllocaOp):
+                            inner.variables[ret_val] = f"arg_{n_inputs + ret_idx}"
+                    break
+
             for idx, in_arg in enumerate(ftyp.inputs.data):
                 inner.print(f"{self.mlir_type_to_ftn_type(in_arg)}, intent(in) :: arg_{idx}")
 
-            for idx, out_arg in enumerate(ftyp.outputs.data, start=len(ftyp.inputs)):
+            for idx, out_arg in enumerate(ftyp.outputs.data, start=len(ftyp.inputs.data)):
                 inner.print(f"{self.mlir_type_to_ftn_type(out_arg)}, intent(out) :: arg_{idx}")
 
             inner.print("")
