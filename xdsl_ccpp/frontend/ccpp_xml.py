@@ -197,7 +197,7 @@ class ccppXML:
                 else:
                     assert parse_state != ccppXML.MetaParseState.NONE
                     assert "=" in sline
-                    tokens=sline.split("=")
+                    tokens=sline.split("=", 1)
                     if parse_state == ccppXML.MetaParseState.PROPERTIES:
                         assert current_table_properties is not None
                         current_table_properties.setAttr(tokens[0].strip(), tokens[1].strip())
@@ -235,7 +235,7 @@ class ccppXML:
             for fn_arg in table.getFunctionArguments():
                 args.append(ArgumentOp(fn_arg.name, fn_arg.getAttr("type"), fn_arg.getAttrs()))
             tables.append(ArgumentTableOp(table.getAttr("name"), str(table.getAttr("type")), args))
-        return TablePropertiesOp(table.getAttr("name"), str(table.getAttr("type")), tables)
+        return TablePropertiesOp(meta.table_properties.getAttr("name"), str(meta.table_properties.getAttr("type")), tables)
 
     def run(self):
         ir_ops=[]
