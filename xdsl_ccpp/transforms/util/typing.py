@@ -1,4 +1,5 @@
 from xdsl.dialects import builtin, memref
+from xdsl.dialects.builtin import DYNAMIC_INDEX
 
 
 class TypeConversions():
@@ -6,9 +7,12 @@ class TypeConversions():
 
     CCPP ``.meta`` files describe argument types using plain strings (e.g.
     ``type = real``) with an optional ``kind`` qualifier (e.g.
-    ``kind = len=512`` for a fixed-length character array).  This class
-    centralises the conversion of those strings into concrete MLIR types so
-    that the rest of the pipeline can work with typed IR from the start.
+    ``kind = len=512`` for a fixed-length character array) and an optional
+    dimension count derived from the ``dimensions`` tuple.
+
+    This class centralises the conversion of those strings into concrete MLIR
+    types so that the rest of the pipeline can work with typed IR from the
+    start.
 
     All methods are class methods — the class is never instantiated.
 
@@ -22,11 +26,14 @@ class TypeConversions():
     ``real``      ``f64``      Default Fortran double precision
     ============  ===========  ======================================
 
-    The ``kind`` qualifier is currently used only for ``character`` to specify
-    the string length via ``len=<N>``, which produces a ranked ``memref<N x i8>``.
-    For all other types (or when ``kind`` is absent) a zero-dimensional
-    ``memref<base_type>`` is returned, which the Fortran printer treats as a
-    plain scalar.
+    The ``kind`` qualifier is used for ``character`` to specify the string
+    length via ``len=<N>``, producing a ranked ``memref<N x i8>``.
+
+    The ``dimensions`` count is used for array arguments: each dimension
+    becomes a ``DYNAMIC_INDEX`` (``?``) entry in the memref shape, producing
+    e.g. ``memref<?x?xf64>`` for a 2-D real array.  The actual extents are
+    not known at compile time — they are supplied by the host model at runtime
+    through Fortran's assumed-shape array mechanism.
     """
 
     # Mapping from CCPP metadata type string → MLIR scalar type
@@ -37,28 +44,37 @@ class TypeConversions():
     }
 
     @classmethod
-    def convert(cls, text_type, kind=None):
-        """Convert a CCPP type string (and optional kind) to a `memref` MLIR type.
+    def convert(cls, text_type, kind=None, dimensions=0):
+        """Convert a CCPP type string (and optional kind/dimensions) to a `memref` MLIR type.
 
         Args:
             text_type: CCPP type string, one of ``"character"``, ``"integer"``,
                        or ``"real"``.
             kind: Optional kind qualifier string from the ``.meta`` file.
-                  Currently only ``"len=<N>"`` is handled, which sets the memref
-                  shape to ``[N]`` for character arrays.
+                  Only ``"len=<N>"`` is handled, producing a ``memref<N x i8>``
+                  for fixed-length character strings.
+            dimensions: Number of array dimensions (0 = scalar).  For each
+                        dimension a ``DYNAMIC_INDEX`` (``?``) entry is added to
+                        the memref shape, producing e.g. ``memref<?x?xf64>``.
 
         Returns:
             A `memref.MemRefType` with:
 
-            - Shape ``[N]`` if ``kind = "len=N"`` (ranked character array).
+            - Shape ``[N]`` if ``kind = "len=N"`` (fixed-length character array).
+            - Shape ``[?, ?, ...]`` with ``dimensions`` entries if ``dimensions > 0``.
             - Shape ``[]`` (zero-dimensional scalar memref) otherwise.
         """
         base_type = cls.getBaseType(text_type)
         shape = []
-        if kind is not None:
-            # A 'len=N' kind qualifier means a fixed-length character array
-            if "len=" in kind:
-                shape = [int(kind.split("=")[1])]
+        if kind is not None and "len=" in kind:
+            # A 'len=N' kind qualifier on a character type sets the string length.
+            # Other kind values (e.g. 'kind_phys') are Fortran precision specifiers
+            # and have no effect on the memref shape.
+            shape = [int(kind.split("=")[1])]
+        elif dimensions > 0:
+            # Each CCPP dimension maps to a dynamic-size axis in the memref;
+            # the actual extent is provided by the host at runtime
+            shape = [DYNAMIC_INDEX] * dimensions
         return memref.MemRefType(base_type, shape)
 
     @classmethod

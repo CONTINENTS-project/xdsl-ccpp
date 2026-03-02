@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from xdsl.dialects.builtin import (
+    IntAttr,
     StringAttr,
     UnitAttr,
 )
@@ -139,7 +140,8 @@ class ArgumentOp(IRDLOperation):
     arg_type = prop_def(StringAttr, prop_name="type")
     standard_name = opt_prop_def(StringAttr)
     long_name = opt_prop_def(StringAttr)
-    # TODO: dimensions
+    # Number of array dimensions (0 = scalar). Stored as IntAttr.
+    dimensions = opt_prop_def(IntAttr)
     kind = opt_prop_def(StringAttr)
     intent = opt_prop_def(StringAttr)
     units = opt_prop_def(StringAttr)
@@ -155,8 +157,14 @@ class ArgumentOp(IRDLOperation):
         properties={"name":arg_name, "type":arg_type}
         prop_keys=list(attributes.keys())
         prop_keys.remove("type")
-        # TODO below
-        if "dimensions" in prop_keys: prop_keys.remove("dimensions")
+
+        # Parse the dimensions tuple string, e.g. "(ncol, lev)" → 2 dimensions
+        if "dimensions" in prop_keys:
+            dim_str = attributes["dimensions"].strip().strip("()")
+            ndims = len([d for d in dim_str.split(",") if d.strip()]) if dim_str.strip() else 0
+            if ndims > 0:
+                properties["dimensions"] = IntAttr(ndims)
+            prop_keys.remove("dimensions")
 
         known_props=["standard_name", "long_name", "kind", "intent", "units"]
         for prop in known_props:

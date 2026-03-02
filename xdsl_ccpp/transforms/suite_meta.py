@@ -111,6 +111,7 @@ class MetaCAP(ModulePass):
             arg_type = TypeConversions.convert(
                 fn_arg.getAttr("type"),
                 fn_arg.getAttr("kind") if fn_arg.hasAttr("kind") else None,
+                fn_arg.getAttr("dimensions") if fn_arg.hasAttr("dimensions") else 0,
             )
             if fn_arg.hasAttr("intent"):
                 if fn_arg.getAttr("intent") == "in":

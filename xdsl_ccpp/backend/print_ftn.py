@@ -186,9 +186,10 @@ class ftnPrintContext:
                 return f"integer"
             case MemRefType(element_type=Attribute() as elem_t, shape=shape):
                 if any(dim.data == DYNAMIC_INDEX for dim in shape):
-                    raise ValueError(
-                        "Can't print memrefs to ftn if they have dynamic sizes. "
-                    )
+                    # Dynamic-dimension array: return only the base type string.
+                    # The caller uses _ftn_dim_suffix to append '(:, :)' etc. to
+                    # the variable name in the declaration.
+                    return self.mlir_type_to_ftn_type(elem_t)
                 shape_str = ", ".join(str(s.data) for s in shape)
                 type_str = self.mlir_type_to_ftn_type(elem_t)
                 if not shape_str:
@@ -199,6 +200,23 @@ class ftnPrintContext:
                     return f"{type_str}(len={shape_str})"
                 else:
                     return f"{type_str}({shape_str})"
+
+    def _ftn_dim_suffix(self, type_attr: Attribute) -> str:
+        """Return the Fortran assumed-shape array suffix for a memref type.
+
+        For a memref with N dynamic dimensions this returns ``"(:, :, ...)"``
+        (N colons), which is appended to the variable name in a declaration to
+        produce e.g. ``real(kind=8), intent(inout) :: temp_level(:, :)``.
+
+        Returns an empty string for scalar types and statically-sized memrefs
+        (such as ``character(len=512)``).
+        """
+        match type_attr:
+            case MemRefType(shape=shape) if any(dim.data == DYNAMIC_INDEX for dim in shape):
+                # One ':' per dynamic dimension
+                return "(" + ", ".join(":" for _ in shape) + ")"
+            case _:
+                return ""
 
     def attribute_value_to_str(self, attr: Attribute) -> str:
         """Convert a value-carrying attribute to a Fortran literal string.
@@ -483,16 +501,25 @@ class ftnPrintContext:
             for ret_val, out_name in zip(output_ret_vals, output_names):
                 inner.variables[ret_val] = out_name
 
-            # Declare input arguments with intent(in) or intent(inout)
+            # Declare input arguments with intent(in) or intent(inout).
+            # Array block args (dynamic memref) are always intent(inout): the host
+            # provides the buffer and the scheme may write to it in-place.
             for arg, arg_name in zip(bdy.block.args, input_names):
                 type_str = inner.mlir_type_to_ftn_type(arg.type)
-                intent = "inout" if arg in inout_block_args else "in"
-                inner.print(f"{type_str}, intent({intent}) :: {arg_name}")
+                dim_suffix = inner._ftn_dim_suffix(arg.type)
+                if dim_suffix:
+                    intent = "inout"
+                elif arg in inout_block_args:
+                    intent = "inout"
+                else:
+                    intent = "in"
+                inner.print(f"{type_str}, intent({intent}) :: {arg_name}{dim_suffix}")
 
-            # Declare output arguments with intent(out)
+            # Declare output arguments with intent(out) (always scalars)
             for ret_val, out_name in zip(output_ret_vals, output_names):
                 type_str = inner.mlir_type_to_ftn_type(ret_val.type)
-                inner.print(f"{type_str}, intent(out) :: {out_name}")
+                dim_suffix = inner._ftn_dim_suffix(ret_val.type)
+                inner.print(f"{type_str}, intent(out) :: {out_name}{dim_suffix}")
 
             inner.print("")
 

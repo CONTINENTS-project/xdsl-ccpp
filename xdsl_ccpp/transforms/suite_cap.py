@@ -223,13 +223,26 @@ class GenerateSuiteSubroutine(RewritePattern):
                     else:
                         all_args[fn_arg.name] = fn_arg
 
-        # in/inout args become block arguments (input parameters to the cap subroutine)
-        # out-only args are allocated locally inside the subroutine body
-        input_arg_list = [a for a in all_args.values() if a.getAttr("intent") in ("in", "inout")]
-        output_arg_list = [a for a in all_args.values() if a.getAttr("intent") == "out"]
+        # in/inout args become block arguments (input parameters to the cap subroutine).
+        # out-only scalar args are allocated locally; out array args also become block
+        # arguments because the host always owns the array buffer and we cannot
+        # allocate a dynamic memref without knowing the extents at compile time.
+        def _has_dims(a):
+            return a.hasAttr("dimensions") and a.getAttr("dimensions") > 0
 
-        input_arg_types = [TypeConversions.convert(a.getAttr("type"), a.getAttr("kind") if a.hasAttr("kind") else None)
-                           for a in input_arg_list]
+        input_arg_list = [a for a in all_args.values()
+                          if a.getAttr("intent") in ("in", "inout") or _has_dims(a)]
+        output_arg_list = [a for a in all_args.values()
+                           if a.getAttr("intent") == "out" and not _has_dims(a)]
+
+        input_arg_types = [
+            TypeConversions.convert(
+                a.getAttr("type"),
+                a.getAttr("kind") if a.hasAttr("kind") else None,
+                a.getAttr("dimensions") if a.hasAttr("dimensions") else 0,
+            )
+            for a in input_arg_list
+        ]
 
         new_block = Block(arg_types=input_arg_types)
 
@@ -276,8 +289,13 @@ class GenerateSuiteSubroutine(RewritePattern):
                 if scheme_name + tgt_subroutine_postfix not in fn_sigs:
                     fn_sigs[scheme_name + tgt_subroutine_postfix] = self.meta_fn_sigs[scheme_name + tgt_subroutine_postfix]
 
-        # inout block args are also returned (they are both inputs and outputs)
-        inout_return_vals = [data_ops[a.name] for a in input_arg_list if a.getAttr("intent") == "inout"]
+        # Scalar inout block args are returned so the caller receives the updated value.
+        # Array inout args are modified in-place through the host's buffer, so they
+        # do not need to be returned — the host observes the changes directly.
+        inout_return_vals = [
+            data_ops[a.name] for a in input_arg_list
+            if a.getAttr("intent") == "inout" and not _has_dims(a)
+        ]
         alloc_return_vals = list(alloc_ops.values())
 
         check_ops = self.generateStateCheckOps(check_string, data_ops) if check_string is not None else []

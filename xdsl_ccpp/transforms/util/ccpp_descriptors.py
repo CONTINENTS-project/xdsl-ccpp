@@ -280,6 +280,10 @@ class BuildMetaDataDescriptions(Visitor):
             if kp in arg_op.properties:
                 arg.setAttr(kp, arg_op.properties[kp].data)
 
+        # dimensions is stored as an IntAttr (count of dimensions); 0 means scalar
+        if "dimensions" in arg_op.properties:
+            arg.setAttr("dimensions", arg_op.properties["dimensions"].data)
+
         # 'optional' is a flag attribute — store as a boolean rather than a string
         if "optional" in arg_op.properties:
             arg["optional"] = True
