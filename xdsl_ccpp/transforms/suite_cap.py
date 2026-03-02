@@ -151,10 +151,11 @@ class GenerateSuiteSubroutine(RewritePattern):
             value=StringAttr(string),
         )
 
-    def generateStateCheckOps(self, check_string: str, data_ops):
+    def generateStateCheckOps(self, check_string: str, data_ops, fn_name: str | None = None):
         """Emit ops that compare ccpp_suite_state against check_string.
 
-        If the state does not match the expected value, errflg is set to 1.
+        If the state does not match the expected value, errflg is set to 1
+        and, when fn_name is provided, an error message is written into errmsg.
         The comparison uses ccpp_utils.StrCmpOp (lowered later by the
         lower-ccpp-utils pass) and an XOrI to negate the equality result.
         """
@@ -172,10 +173,19 @@ class GenerateSuiteSubroutine(RewritePattern):
         one_i1 = arith.ConstantOp.from_int_and_width(1, 1)
         mismatch = arith.XOrIOp(strcmp_op.res, one_i1.result)
 
-        # Set errflg = 1 if the state does not match
+        # Set errflg = 1 if the state does not match; optionally write errmsg
         one = arith.ConstantOp.from_int_and_width(1, 32)
         store = memref.StoreOp.get(one, data_ops["errflg"], [])
-        if_op = scf.IfOp(mismatch.result, [], [one, store, scf.YieldOp()])
+        if fn_name is not None:
+            write_err = ccpp_utils.WriteErrMsgOp(
+                data_ops["errmsg"], loaded_state,
+                "Invalid initial CCPP state, '",
+                f"' in {fn_name}",
+            )
+            true_ops = [write_err, one, store, scf.YieldOp()]
+        else:
+            true_ops = [one, store, scf.YieldOp()]
+        if_op = scf.IfOp(mismatch.result, [], true_ops)
 
         return [addr_const, loaded_const, addr_state, loaded_state, strcmp_op, one_i1, mismatch, if_op]
 
@@ -343,7 +353,8 @@ class GenerateSuiteSubroutine(RewritePattern):
         ]
         alloc_return_vals = list(alloc_ops.values())
 
-        check_ops = self.generateStateCheckOps(check_string, data_ops) if check_string is not None else []
+        errmsg_fn_name = suite_description.attributes["name"] + generated_subroutine_posfix
+        check_ops = self.generateStateCheckOps(check_string, data_ops, errmsg_fn_name) if check_string is not None else []
         state_ops = self.generateStateAssignment(state_string) if state_string is not None else []
 
         body_ops = alloc_return_vals + initialisation_ops + ncol_compute_ops + check_ops + call_ops + state_ops + [func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
