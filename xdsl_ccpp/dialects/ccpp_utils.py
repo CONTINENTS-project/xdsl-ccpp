@@ -1,4 +1,4 @@
-from xdsl.dialects.builtin import IntegerAttr, i1, i64
+from xdsl.dialects.builtin import IntegerAttr, StringAttr, i1, i64
 from xdsl.ir import Dialect
 from xdsl.irdl import (
     IRDLOperation,
@@ -26,8 +26,35 @@ class StrCmpOp(IRDLOperation):
         )
 
 
+@irdl_op_definition
+class StringEqOp(IRDLOperation):
+    """Compare an assumed-length string memref against a compile-time literal.
+
+    lhs is a memref<?xi8> (Fortran character(len=*) buffer).
+    literal is the string constant to compare against.
+    Returns i1: 1 if equal (after trimming whitespace), 0 if not.
+
+    Printed as: trim(lhs) .eq. 'literal'
+    """
+
+    name = "ccpp_utils.string_eq"
+
+    lhs = operand_def()  # memref<?xi8>
+    literal = prop_def(StringAttr)
+    res = result_def(i1)
+
+    def __init__(self, lhs, literal: str | StringAttr):
+        if isinstance(literal, str):
+            literal = StringAttr(literal)
+        super().__init__(
+            operands=[lhs],
+            properties={"literal": literal},
+            result_types=[i1],
+        )
+
+
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp],
+    [StrCmpOp, StringEqOp],
     [],
 )

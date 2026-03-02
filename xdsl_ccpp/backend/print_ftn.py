@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp
+from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -184,6 +184,10 @@ class ftnPrintContext:
             case IntegerType():
                 assert cast(IntegerType, type_attr).width.data == 32
                 return f"integer"
+            case MemRefType(element_type=IntegerType(width=IntAttr(data=8)), shape=shape) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:
+                # A 1-D dynamic i8 memref is an assumed-length Fortran character
+                # argument — declared as character(len=*), not character(:).
+                return "character(len=*)"
             case MemRefType(element_type=Attribute() as elem_t, shape=shape):
                 if any(dim.data == DYNAMIC_INDEX for dim in shape):
                     # Dynamic-dimension array: return only the base type string.
@@ -212,6 +216,9 @@ class ftnPrintContext:
         (such as ``character(len=512)``).
         """
         match type_attr:
+            case MemRefType(element_type=IntegerType(width=IntAttr(data=8)), shape=shape) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:
+                # character(len=*) uses len= notation — no dimension suffix needed
+                return ""
             case MemRefType(shape=shape) if any(dim.data == DYNAMIC_INDEX for dim in shape):
                 # One ':' per dynamic dimension
                 return "(" + ", ".join(":" for _ in shape) + ")"
@@ -296,6 +303,11 @@ class ftnPrintContext:
                 lhs_name = self._get_variable_name_for(op.lhs)
                 rhs_name = self._get_variable_name_for(op.rhs)
                 self.print(f"{lhs_name} .eq. {rhs_name}", end="", use_prefix=False)
+            case CCPPStringEqOp():
+                # Compare an assumed-length string against a compile-time literal
+                lhs_name = self._get_variable_name_for(op.lhs)
+                literal_val = op.literal.data
+                self.print(f"trim({lhs_name}) .eq. '{literal_val}'", end="", use_prefix=False)
             case _:
                 print(type(op))
                 assert False
