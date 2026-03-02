@@ -107,28 +107,19 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         return [err_const_comp, cmp, load_op, conditional_op]
 
-    def generateStateAssignmentGlobal(self, state_string: str) -> llvm.GlobalOp:
+    def generateStringConstantGlobal(self, string: str) -> llvm.GlobalOp:
         return llvm.GlobalOp(
             llvm.LLVMArrayType.from_size_and_type(16, i8),
-            "ccpp_assign_" + state_string,
+            "const_" + string,
             "internal",
             constant=True,
-            value=StringAttr(state_string),
-        )
-
-    def generateStateConstantGlobal(self, check_string: str) -> llvm.GlobalOp:
-        return llvm.GlobalOp(
-            llvm.LLVMArrayType.from_size_and_type(16, i8),
-            "ccpp_state_" + check_string,
-            "internal",
-            constant=True,
-            value=StringAttr(check_string),
+            value=StringAttr(string),
         )
 
     def generateStateCheckOps(self, check_string: str, data_ops):
         arr_type = llvm.LLVMArrayType.from_size_and_type(16, i8)
 
-        addr_const = llvm.AddressOfOp("ccpp_state_" + check_string, llvm.LLVMPointerType())
+        addr_const = llvm.AddressOfOp("const_" + check_string, llvm.LLVMPointerType())
         loaded_const = llvm.LoadOp(addr_const, arr_type)
         addr_state = llvm.AddressOfOp("ccpp_suite_state", llvm.LLVMPointerType())
         loaded_state = llvm.LoadOp(addr_state, arr_type)
@@ -147,7 +138,7 @@ class GenerateSuiteSubroutine(RewritePattern):
 
     def generateStateAssignment(self, state_string: str):
         arr_type = llvm.LLVMArrayType.from_size_and_type(16, i8)
-        addr_src = llvm.AddressOfOp("ccpp_assign_" + state_string, llvm.LLVMPointerType())
+        addr_src = llvm.AddressOfOp("const_" + state_string, llvm.LLVMPointerType())
         loaded = llvm.LoadOp(addr_src, arr_type)
         addr_dst = llvm.AddressOfOp("ccpp_suite_state", llvm.LLVMPointerType())
         store = llvm.StoreOp(loaded, addr_dst)
@@ -229,22 +220,42 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         return new_func, list(fn_sigs.values())
 
-    def clone_func_defs(self, *func_defs):
-        ops=[]
-        for fn_def_l in func_defs:
-            for func_def in fn_def_l:
-              ops.append(func.FuncOp.external(func_def.sym_name.data, func_def.function_type.inputs, func_def.function_type.outputs))
-        return ops
+    def clone_func_defs(self, func_defs):
+        return [
+            func.FuncOp.external(fd.sym_name.data, fd.function_type.inputs, fd.function_type.outputs)
+            for fd in func_defs
+        ]
 
     @op_type_rewrite_pattern
     def match_and_rewrite(self, op: ccpp.SuiteOp, rewriter: PatternRewriter):
         suite_description=self.suite_descriptions[op.suite_name.data]
 
-        init_fn, init_fn_sigs=self.generateSubroutineCall(suite_description, "_init", "_initialize", state_string="initialized")
-        finalise_fn, finalise_fn_sigs=self.generateSubroutineCall(suite_description, "_finalize", state_string="uninitialized")
-        physics_fn, physics_fn_sigs=self.generateSubroutineCall(suite_description, "_run", "_physics", check_string="initialized")
+        # (tgt_postfix, gen_postfix, state_string, check_string)
+        subroutine_specs = [
+            ("_init",     "_initialize", "initialized",  "uninitialized"),
+            ("_finalize", None,          "uninitialized", "initialized"),
+            ("_run",      "_physics",    None,            "initialized"),
+        ]
 
-        fn_sigs=self.clone_func_defs(init_fn_sigs, finalise_fn_sigs, physics_fn_sigs)
+        generated_fns = []
+        fn_sigs_by_name = {}
+        check_strings_used = set()
+        state_strings_used = set()
+
+        for tgt_postfix, gen_postfix, state_string, check_string in subroutine_specs:
+            fn, sigs = self.generateSubroutineCall(
+                suite_description, tgt_postfix, gen_postfix,
+                state_string=state_string, check_string=check_string,
+            )
+            generated_fns.append(fn)
+            for sig in sigs:
+                fn_sigs_by_name[sig.sym_name.data] = sig
+            if check_string is not None:
+                check_strings_used.add(check_string)
+            if state_string is not None:
+                state_strings_used.add(state_string)
+
+        fn_sigs = self.clone_func_defs(list(fn_sigs_by_name.values()))
 
         ccpp_suite_state_global = llvm.GlobalOp(
             llvm.LLVMArrayType.from_size_and_type(16, i8),
@@ -253,13 +264,10 @@ class GenerateSuiteSubroutine(RewritePattern):
             value=StringAttr("uninitialized"),
         )
 
-        check_strings_used = {cs for cs in [None, None, "initialized"] if cs is not None}
-        state_const_globals = [self.generateStateConstantGlobal(cs) for cs in sorted(check_strings_used)]
+        all_strings_used = check_strings_used | state_strings_used
+        string_const_globals = [self.generateStringConstantGlobal(s) for s in sorted(all_strings_used)]
 
-        state_strings_used = {"initialized", "uninitialized"}
-        state_assign_globals = [self.generateStateAssignmentGlobal(ss) for ss in sorted(state_strings_used)]
-
-        scheme_mod=builtin.ModuleOp([ccpp_suite_state_global]+state_const_globals+state_assign_globals+[init_fn, finalise_fn, physics_fn]+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
+        scheme_mod=builtin.ModuleOp([ccpp_suite_state_global]+string_const_globals+generated_fns+fn_sigs, sym_name=builtin.StringAttr(op.suite_name.data+"_cap"))
 
         rewriter.insert_op(scheme_mod, InsertPoint.at_start(self.top_level_module.body.block))
 
