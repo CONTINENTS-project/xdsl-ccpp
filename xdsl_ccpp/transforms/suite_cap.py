@@ -232,9 +232,10 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         new_fn_type = builtin.FunctionType.from_lists(input_arg_types, return_types)
         new_func=func.FuncOp(
-        suite_description.attributes["name"]+"_suite"+generated_subroutine_posfix,
-        new_fn_type,
-        body,
+            suite_description.attributes["name"]+"_suite"+generated_subroutine_posfix,
+            new_fn_type,
+            body,
+            visibility="public",
         )
 
         return new_func, list(fn_sigs.values())

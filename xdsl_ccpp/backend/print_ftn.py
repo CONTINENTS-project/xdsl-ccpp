@@ -317,6 +317,17 @@ class ftnPrintContext:
                 else:
                     self.print(f"character(len=16) :: {name} = '{val}'", prefix="  ")
 
+        public_procs = [
+            op.sym_name.data
+            for op in body.ops
+            if isa(op, func.FuncOp)
+            and not op.is_declaration
+            and op.sym_visibility is not None
+            and op.sym_visibility.data == "public"
+        ]
+        for proc in public_procs:
+            self.print(f"public :: {proc}", prefix="  ")
+
         self.print("\nCONTAINS")
 
         with self.descend() as inner:
