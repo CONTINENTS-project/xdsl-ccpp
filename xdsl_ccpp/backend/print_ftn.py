@@ -385,7 +385,8 @@ class ftnPrintContext:
                 mod = op.attributes["module"].data
                 use_map.setdefault(mod, []).append(op.sym_name.data)
         for mod, procs in sorted(use_map.items()):
-            self.print(f"use {mod}, only: {', '.join(sorted(procs))}", prefix="  ")
+            for proc in sorted(procs):
+                self.print(f"use {mod}, only: {proc}", prefix="  ")
 
         self.print("\nimplicit none", prefix="  ")
         self.print("private", prefix="  ")
