@@ -28,6 +28,7 @@ class TableTypeKind(StrEnum):
     Scheme = auto()
     Module = auto()
     DDT = auto()
+    Host = auto()
 
 @irdl_attr_definition
 class TableTypeKindAttr(EnumAttribute[TableTypeKind], SpacedOpaqueSyntaxAttribute):

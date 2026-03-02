@@ -14,11 +14,13 @@ class CCPPType(StrEnum):
     - ``SCHEME``  — a physics parameterisation module
     - ``MODULE``  — a host-model data module
     - ``DDT``     — a derived data type definition
+    - ``HOST``    — a host-model subroutine cap
     """
 
     SCHEME = auto()
     MODULE = auto()
     DDT = auto()
+    HOST = auto()
 
 
 class MetaData:
@@ -301,10 +303,11 @@ class ccppXML:
         - ``[ccpp-table-properties]`` — top-level properties for the scheme/module
         - ``[ccpp-arg-table]``         — introduces an argument table for one entry point
         - ``[ arg_name ]``             — introduces the attributes for one argument
-          (identified by surrounding spaces inside the brackets)
+          (identified by at least one space inside the brackets on either side)
 
-        Lines outside headers are ``key = value`` pairs assigned to whichever
-        descriptor is currently active.
+        Lines outside headers are ``key = value`` pairs.  Multiple attributes
+        may appear on one line separated by ``|``
+        (e.g. ``type = real | kind = kind_phys``).  Blank lines are ignored.
 
         Args:
             filename: Path to the ``.meta`` file.
@@ -323,6 +326,11 @@ class ccppXML:
         with open(filename) as file:
             for line in file:
                 sline = line.strip()
+
+                # Ignore blank lines
+                if not sline:
+                    continue
+
                 if "[" in sline and "]" in sline:
                     # Strip brackets to get the section token
                     token = sline.translate(str.maketrans('', '', "[]"))
@@ -345,8 +353,9 @@ class ccppXML:
                         # Begin a new argument-table header block
                         parse_state = ccppXML.MetaParseState.ARG_TABLE
                         current_arg_table = CCPPArgumentTable()
-                    elif token[0] == " " and token[-1] == " ":
-                        # Argument block — token is the variable name (with surrounding spaces)
+                    elif token[0] == " " or token[-1] == " ":
+                        # Argument block — token is the variable name; spaces may appear
+                        # on one or both sides (e.g. '[ ncols]' or '[ temp_level ]')
                         if current_arg is not None:
                             current_arg_table.setFunctionArgument(current_arg)
                         parse_state = ccppXML.MetaParseState.ARG
@@ -354,20 +363,26 @@ class ccppXML:
                     else:
                         assert False
                 else:
-                    # Key = value line — route to whichever descriptor is active
+                    # Attribute line — one or more key = value pairs separated by '|'
+                    # e.g. 'type = real | kind = kind_phys' or 'kind = len=512'
                     assert parse_state != ccppXML.MetaParseState.NONE
-                    assert "=" in sline
-                    # Split on the first '=' only so that values like 'kind = len=512' are preserved
-                    tokens = sline.split("=", 1)
-                    if parse_state == ccppXML.MetaParseState.PROPERTIES:
-                        assert current_table_properties is not None
-                        current_table_properties.setAttr(tokens[0].strip(), tokens[1].strip())
-                    elif parse_state == ccppXML.MetaParseState.ARG_TABLE:
-                        assert current_arg_table is not None
-                        current_arg_table.setAttr(tokens[0].strip(), tokens[1].strip())
-                    elif parse_state == ccppXML.MetaParseState.ARG:
-                        assert current_arg is not None
-                        current_arg.setAttr(tokens[0].strip(), tokens[1].strip())
+                    for part in sline.split("|"):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        assert "=" in part
+                        # Split on the first '=' only to preserve values like 'len=512'
+                        key, value = part.split("=", 1)
+                        key, value = key.strip(), value.strip()
+                        if parse_state == ccppXML.MetaParseState.PROPERTIES:
+                            assert current_table_properties is not None
+                            current_table_properties.setAttr(key, value)
+                        elif parse_state == ccppXML.MetaParseState.ARG_TABLE:
+                            assert current_arg_table is not None
+                            current_arg_table.setAttr(key, value)
+                        elif parse_state == ccppXML.MetaParseState.ARG:
+                            assert current_arg is not None
+                            current_arg.setAttr(key, value)
 
         # Flush any in-progress argument or argument table at end-of-file
         if current_arg is not None:
@@ -455,7 +470,7 @@ class ccppXML:
         # Parse each host metadata file and emit a TablePropertiesOp
         hosts = {}
         for host_file in self.options_db["host_files"]:
-            c = self.parse_metadata_file(host_file, True)
+            c = self.parse_metadata_file(host_file, False)
             hosts[c.table_properties.getAttr("name")] = c
             ir_ops.append(self.build_meta_ir(c))
 

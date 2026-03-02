@@ -12,11 +12,13 @@ class CCPPType(StrEnum):
     - ``SCHEME``  — a physics parameterisation module
     - ``MODULE``  — a host-model data module
     - ``DDT``     — a derived data type definition
+    - ``HOST``    — a host-model subroutine cap
     """
 
     SCHEME = auto()
     MODULE = auto()
     DDT = auto()
+    HOST = auto()
 
 
 class CCPPItem:
