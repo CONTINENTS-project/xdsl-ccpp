@@ -177,6 +177,7 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         data_ops={}
         for idx, fn_arg in enumerate(input_arg_list):
+            new_block.args[idx].name_hint=fn_arg.name
             data_ops[fn_arg.name]=new_block.args[idx]
 
         alloc_ops={}
@@ -186,6 +187,7 @@ class GenerateSuiteSubroutine(RewritePattern):
             if arg_type=="character":
                 data_shape.append(int(fn_arg.getAttr("kind").split("=")[1]))
             alloc_op=memref.AllocaOp.get(TypeConversions.getBaseType(arg_type), shape=data_shape)
+            alloc_op.memref.name_hint=fn_arg.name
             alloc_ops[fn_arg.name]=alloc_op
             data_ops[fn_arg.name]=alloc_op
 
@@ -193,10 +195,12 @@ class GenerateSuiteSubroutine(RewritePattern):
         # functions are called (e.g. when tgt_subroutine_postfix is None)
         if "errflg" not in data_ops:
             alloc_op=memref.AllocaOp.get(TypeConversions.getBaseType("integer"), shape=[])
+            alloc_op.memref.name_hint="errflg"
             alloc_ops["errflg"]=alloc_op
             data_ops["errflg"]=alloc_op
         if "errmsg" not in data_ops:
             alloc_op=memref.AllocaOp.get(TypeConversions.getBaseType("character"), shape=[512])
+            alloc_op.memref.name_hint="errmsg"
             alloc_ops["errmsg"]=alloc_op
             data_ops["errmsg"]=alloc_op
 

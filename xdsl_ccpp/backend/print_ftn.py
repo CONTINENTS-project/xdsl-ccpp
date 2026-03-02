@@ -363,43 +363,50 @@ class ftnPrintContext:
 
     def _print_fn(
         self,
-        name: StringAttr,
+        fn_name: StringAttr,
         bdy: Region,
         ftyp: FunctionType,
     ):
-        """
-        Shared printing logic for printing tasks and functions.
-        """
-        args = ", ".join(
-            f"arg_{idx}"
-            for idx, arg in enumerate(ftyp.inputs.data + ftyp.outputs.data)
-        )
-        ret = (
-            "void"
-            #if len(ftyp.outputs) == 0
-            #else self.mlir_type_to_csl_type(ftyp.outputs.data[0])
-        )
-        start_signature = f"\nsubroutine {name.data}({args})"
-        end_signature = f"end subroutine {name.data}"
+        # Collect input arg names from block arg name hints
+        input_names = [
+            arg.name_hint if arg.name_hint is not None else f"arg_{idx}"
+            for idx, arg in enumerate(bdy.block.args)
+        ]
+
+        # Scan ReturnOp for output alloca results and detect inout block args
+        output_names: list[str] = []
+        output_ret_vals: list = []
+        inout_block_args: set = set()
+        for op in bdy.block.ops:
+            if isa(op, func.ReturnOp):
+                for ret_val in op.arguments:
+                    if isa(ret_val.owner, memref.AllocaOp):
+                        out_name = ret_val.name_hint if ret_val.name_hint is not None else f"out_{len(output_names)}"
+                        output_names.append(out_name)
+                        output_ret_vals.append(ret_val)
+                    else:
+                        inout_block_args.add(ret_val)
+                break
+
+        args_str = ", ".join(input_names + output_names)
+        start_signature = f"\nsubroutine {fn_name.data}({args_str})"
+        end_signature = f"end subroutine {fn_name.data}"
+
         with self.descend(start_signature, end_signature) as inner:
-            # Register block args (in/inout args) as arg_0, arg_1, ...
-            for idx, arg in enumerate(bdy.block.args):
-                inner.variables[arg] = f"arg_{idx}"
+            for arg, arg_name in zip(bdy.block.args, input_names):
+                inner.variables[arg] = arg_name
 
-            # Register alloca results (out args) by scanning ReturnOp
-            n_inputs = len(ftyp.inputs.data)
-            for op in bdy.block.ops:
-                if isa(op, func.ReturnOp):
-                    for ret_idx, ret_val in enumerate(op.arguments):
-                        if isa(ret_val.owner, memref.AllocaOp):
-                            inner.variables[ret_val] = f"arg_{n_inputs + ret_idx}"
-                    break
+            for ret_val, out_name in zip(output_ret_vals, output_names):
+                inner.variables[ret_val] = out_name
 
-            for idx, in_arg in enumerate(ftyp.inputs.data):
-                inner.print(f"{self.mlir_type_to_ftn_type(in_arg)}, intent(in) :: arg_{idx}")
+            for arg, arg_name in zip(bdy.block.args, input_names):
+                type_str = inner.mlir_type_to_ftn_type(arg.type)
+                intent = "inout" if arg in inout_block_args else "in"
+                inner.print(f"{type_str}, intent({intent}) :: {arg_name}")
 
-            for idx, out_arg in enumerate(ftyp.outputs.data, start=len(ftyp.inputs.data)):
-                inner.print(f"{self.mlir_type_to_ftn_type(out_arg)}, intent(out) :: arg_{idx}")
+            for ret_val, out_name in zip(output_ret_vals, output_names):
+                type_str = inner.mlir_type_to_ftn_type(ret_val.type)
+                inner.print(f"{type_str}, intent(out) :: {out_name}")
 
             inner.print("")
 
