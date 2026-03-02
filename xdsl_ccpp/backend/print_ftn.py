@@ -38,6 +38,9 @@ from xdsl.utils.comparisons import to_unsigned
 from xdsl.utils.hints import isa
 
 
+_MAX_LINE_LEN = 99
+
+
 @dataclass
 class ftnPrintContext:
     """Stateful context for printing MLIR IR as Fortran source text.
@@ -60,6 +63,9 @@ class ftnPrintContext:
 
     # Counter used to generate unique fallback variable names
     _counter: int = field(default=0)
+
+    # Buffer accumulating the current line being built via partial print() calls
+    _line_buf: str = field(default="")
 
     # Maps arith op names to their Fortran infix operator strings
     _binops: dict[str, str] = field(default_factory=dict[str, str])
@@ -618,14 +624,47 @@ class ftnPrintContext:
             self.print(f"{block_end} ")
 
     def print(self, text: str, prefix: str = "", end: str = "\n", use_prefix=True):
-        """Print text to the output stream, applying the current indentation.
+        """Append text to the current line buffer, flushing on newline.
 
-        Multi-line strings are split and each line is prefixed individually.
-        Pass use_prefix=False to suppress indentation (e.g. for continuations
-        on the same line).
+        Embedded newlines in text cause an immediate buffer flush each time
+        they are encountered.  When end="\\n" (the default) the buffer is
+        flushed at the end of the call.  Passing use_prefix=False suppresses
+        the indentation prefix for inline continuations.
         """
-        for l in text.split("\n"):
-            print((self._prefix + prefix if use_prefix else "") + l, file=self.output, end=end)
+        parts = text.split("\n")
+        for i, part in enumerate(parts):
+            if i > 0:
+                self._emit_line()
+            self._line_buf += (self._prefix + prefix if use_prefix else "") + part
+        if end == "\n":
+            self._emit_line()
+
+    def _emit_line(self):
+        """Flush the line buffer, splitting at commas if the line is too long."""
+        line = self._line_buf
+        self._line_buf = ""
+        self._write_with_continuation(line, self._prefix + self._INDENT)
+
+    def _write_with_continuation(self, line: str, cont_prefix: str):
+        """Write line, inserting Fortran continuation markers at commas if needed.
+
+        If line exceeds _MAX_LINE_LEN characters, the last comma at or before
+        position _MAX_LINE_LEN - 2 is used as the split point: the first part
+        is written with a trailing ' &' and the remainder is written on the
+        next line starting with cont_prefix.  Recurses until the remainder fits.
+        """
+        if len(line) <= _MAX_LINE_LEN:
+            print(line, file=self.output)
+            return
+        # Search for the last comma that leaves room for ' &' within the limit
+        split_pos = line.rfind(",", 0, _MAX_LINE_LEN - 2)
+        if split_pos == -1:
+            # No valid split point — emit as-is rather than produce invalid Fortran
+            print(line, file=self.output)
+            return
+        print(line[:split_pos + 1].ljust(_MAX_LINE_LEN - 1) + "&", file=self.output)
+        remainder = cont_prefix + line[split_pos + 1:].lstrip()
+        self._write_with_continuation(remainder, cont_prefix)
 
     def print_block(self, body: Block):
         """Iterate over every operation in body and dispatch it to print_op."""
