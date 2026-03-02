@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from xdsl.dialects import builtin, memref, func, arith, scf
+from xdsl.dialects import builtin, memref, func, arith, scf, llvm
 from xdsl.dialects.builtin import i8, StringAttr, DYNAMIC_INDEX
 from xdsl.context import Context
 from xdsl.passes import ModulePass
@@ -8,9 +8,9 @@ from xdsl.ir import Block, Region
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects import ccpp_utils
-from xdsl_ccpp.dialects.ccpp_utils import StringEqOp
+from xdsl_ccpp.dialects.ccpp_utils import StringEqOp, HostVarRefOp, WriteErrMsgOp
 
-from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription
+from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPType
 from xdsl_ccpp.transforms.util.typing import TypeConversions
 
 
@@ -48,10 +48,11 @@ class CCPPCAP(ModulePass):
         every public subroutine definition it contains.
 
         Returns:
-            dict mapping function_name → (module_name, output_types) where
-            output_types is the list of MLIR result types for that function.
-            Used both to resolve callee module names and to derive call return
-            types for lifecycle phases that have no scheme arg tables.
+            dict mapping function_name → (module_name, output_types,
+            input_types, input_names) where output_types and input_types are
+            lists of MLIR types and input_names is the list of block arg
+            name_hints.  Used to resolve callee module names, derive return
+            types, and forward physics input arguments for the run dispatcher.
         """
         public_fns = {}
         for op in ops:
@@ -68,6 +69,8 @@ class CCPPCAP(ModulePass):
                     public_fns[child.sym_name.data] = (
                         mod_name,
                         list(child.function_type.outputs),
+                        list(child.function_type.inputs),
+                        [arg.name_hint for arg in child.body.block.args],
                     )
         return public_fns
 
@@ -137,7 +140,7 @@ class CCPPCAP(ModulePass):
             f"Suite callee '{suite_callee}' not found among public suite cap "
             f"functions; available: {sorted(public_fns)}"
         )
-        callee_module, _callee_output_types = public_fns[suite_callee]
+        callee_module, _callee_output_types, _, _ = public_fns[suite_callee]
         errmsg_alloc = memref.AllocaOp.get(char_base, shape=[512])
         errmsg_alloc.memref.name_hint = "errmsg"
         errflg_alloc = memref.AllocaOp.get(int_base, shape=[])
@@ -189,13 +192,231 @@ class CCPPCAP(ModulePass):
         decl.attributes["module"] = StringAttr(callee_module)
         return cap_fn, decl
 
+    def _generate_run_fn(
+        self, fn_name, suite_name, suite_part, suite_callee,
+        suite_name_type, errmsg_type, errflg_type, char_base, int_base,
+        public_fns, scheme_names, meta_data,
+    ):
+        """Build the CCPP cap physics run FuncOp and its external declaration.
+
+        Unlike ``_generate_lifecycle_fn``, the run function:
+          1. Takes ``suite_part`` (assumed-length character) as a second
+             dispatch argument after ``suite_name``.
+          2. Accepts ``errmsg`` and ``errflg`` as ``intent(inout)`` block
+             arguments (not local allocas).
+          3. Maps physics input args to host module variables (via
+             standard_name matching against MODULE-type metadata), removing
+             them from the run function's argument list.  Args without a host
+             mapping remain as ordinary block arguments.
+          4. Emits ``llvm.GlobalOp`` stubs (with a ``module`` attribute) for
+             each host variable so the Fortran printer generates the correct
+             ``use <module>, only: <var>`` statements.
+          5. Nests two ``StringEqOp`` comparisons: outer on ``suite_name``,
+             inner on ``suite_part``.
+          6. Emits ``WriteErrMsgOp`` in both else branches.
+
+        Returns ``(FuncOp, external_decl_FuncOp, host_global_ops)``.
+        """
+        assert suite_callee in public_fns, (
+            f"Suite callee '{suite_callee}' not found; "
+            f"available: {sorted(public_fns)}"
+        )
+        callee_module, callee_output_types, callee_input_types, callee_input_names = (
+            public_fns[suite_callee]
+        )
+
+        # ── Standard-name lookup for physics args ────────────────────────────
+        # Build {local_arg_name → standard_name} from the _run arg tables.
+        std_name_of = {}
+        for scheme_name in scheme_names:
+            table_name = scheme_name + "_run"
+            if scheme_name not in meta_data:
+                continue
+            if table_name not in meta_data[scheme_name].arg_tables:
+                continue
+            for fn_arg in meta_data[scheme_name].getArgTable(table_name).getFunctionArguments():
+                if fn_arg.name not in std_name_of and fn_arg.hasAttr("standard_name"):
+                    std_name_of[fn_arg.name] = fn_arg.getAttr("standard_name")
+
+        # Build {standard_name → (host_var_name, module_name)} from MODULE metadata.
+        host_var_map = {}
+        for tbl_name, props in meta_data.items():
+            if props.getAttr("type") != CCPPType.MODULE:
+                continue
+            if tbl_name not in props.arg_tables:
+                continue
+            for var in props.getArgTable(tbl_name).getFunctionArguments():
+                if var.hasAttr("standard_name"):
+                    host_var_map[var.getAttr("standard_name")] = (var.name, tbl_name)
+
+        # Classify each callee input arg as host-mapped or a plain block arg.
+        # physics_arg_sources[i] = ("host", host_var_name, module_name)
+        #                          or ("block",)
+        physics_arg_sources = []
+        for arg_name in callee_input_names:
+            std_name = std_name_of.get(arg_name)
+            if std_name and std_name in host_var_map:
+                host_var_name, host_module_name = host_var_map[std_name]
+                # Assert the host variable is actually declared in that module.
+                assert host_var_name in (
+                    meta_data[host_module_name].arg_tables[host_module_name].function_arguments
+                ), (
+                    f"Host variable '{host_var_name}' not found in "
+                    f"'{host_module_name}' arg table"
+                )
+                physics_arg_sources.append(("host", host_var_name, host_module_name))
+            else:
+                physics_arg_sources.append(("block",))
+
+        suite_part_type = suite_name_type  # also memref<?xi8>
+
+        # Non-host physics args become block args of the run function.
+        non_host_args = [
+            (callee_input_names[i], callee_input_types[i])
+            for i, src in enumerate(physics_arg_sources)
+            if src[0] == "block"
+        ]
+
+        # Block args: suite_name, suite_part, non_host_physics_args..., errmsg, errflg
+        n_non_host = len(non_host_args)
+        all_block_types = (
+            [suite_name_type, suite_part_type]
+            + [t for _, t in non_host_args]
+            + [errmsg_type, errflg_type]
+        )
+        new_block = Block(arg_types=all_block_types)
+
+        suite_name_arg = new_block.args[0]
+        suite_name_arg.name_hint = "suite_name"
+        suite_part_arg = new_block.args[1]
+        suite_part_arg.name_hint = "suite_part"
+
+        _run_arg_rename = {"ncol": "col_start", "nbox": "col_end"}
+        block_arg_map = {}
+        for i, (arg_name, _) in enumerate(non_host_args):
+            ba = new_block.args[2 + i]
+            ba.name_hint = _run_arg_rename.get(arg_name, arg_name)
+            block_arg_map[arg_name] = ba
+
+        errmsg_arg = new_block.args[2 + n_non_host]
+        errmsg_arg.name_hint = "errmsg"
+        errflg_arg = new_block.args[2 + n_non_host + 1]
+        errflg_arg.name_hint = "errflg"
+
+        # ── HostVarRefOps and GlobalOp stubs for host-mapped args ─────────────
+        # One HostVarRefOp per host-mapped arg (placed in the main block so it
+        # is in scope for the nested CallOp).  One llvm.GlobalOp stub (with a
+        # 'module' attribute) per unique (host_var_name, module_name) pair so
+        # the printer generates 'use <module>, only: <var>' in the preamble.
+        host_var_ref_ops = []
+        host_var_ref_results = {}   # arg_name → SSA value
+        host_global_ops = []
+        seen_host_globals: set = set()
+
+        for i, (arg_name, arg_type) in enumerate(zip(callee_input_names, callee_input_types)):
+            src = physics_arg_sources[i]
+            if src[0] != "host":
+                continue
+            _, host_var_name, host_module_name = src
+            ref_op = HostVarRefOp(host_var_name, host_module_name, arg_type)
+            host_var_ref_ops.append(ref_op)
+            host_var_ref_results[arg_name] = ref_op.res
+
+            key = (host_var_name, host_module_name)
+            if key not in seen_host_globals:
+                seen_host_globals.add(key)
+                glob = llvm.GlobalOp(
+                    llvm.LLVMArrayType.from_size_and_type(1, i8),
+                    host_var_name,
+                    "external",
+                )
+                glob.attributes["module"] = StringAttr(host_module_name)
+                host_global_ops.append(glob)
+
+        # Build call args in callee order (mix of host refs and block args).
+        call_args = []
+        for i, arg_name in enumerate(callee_input_names):
+            if physics_arg_sources[i][0] == "host":
+                call_args.append(host_var_ref_results[arg_name])
+            else:
+                call_args.append(block_arg_map[arg_name])
+
+        # ── Body ops ──────────────────────────────────────────────────────────
+        err_const = arith.ConstantOp.from_int_and_width(0, 32)
+        store_errflg = memref.StoreOp.get(err_const, errflg_arg, [])
+
+        suite_name_eq = StringEqOp(suite_name_arg, suite_name)
+        suite_part_eq = StringEqOp(suite_part_arg, suite_part)
+
+        call_op = func.CallOp(suite_callee, call_args, callee_output_types)
+
+        copy_ops = []
+        for idx, ret_type in enumerate(callee_output_types):
+            if ret_type == errmsg_type:
+                copy_ops.append(memref.CopyOp(call_op.results[idx], errmsg_arg))
+            elif ret_type == errflg_type:
+                copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_arg))
+
+        write_suite_part = WriteErrMsgOp(
+            errmsg_arg, suite_part_arg,
+            "No suite part named ",
+            f" found in suite {suite_name}",
+        )
+        one_inner = arith.ConstantOp.from_int_and_width(1, 32)
+        store_errflg_inner = memref.StoreOp.get(one_inner, errflg_arg, [])
+
+        inner_if = scf.IfOp(
+            suite_part_eq.res, [],
+            [call_op] + copy_ops + [scf.YieldOp()],
+            [write_suite_part, one_inner, store_errflg_inner, scf.YieldOp()],
+        )
+
+        write_suite_name = WriteErrMsgOp(
+            errmsg_arg, suite_name_arg,
+            "No suite named ",
+            "found",
+        )
+        one_outer = arith.ConstantOp.from_int_and_width(1, 32)
+        store_errflg_outer = memref.StoreOp.get(one_outer, errflg_arg, [])
+
+        outer_if = scf.IfOp(
+            suite_name_eq.res, [],
+            [suite_part_eq, inner_if, scf.YieldOp()],
+            [write_suite_name, one_outer, store_errflg_outer, scf.YieldOp()],
+        )
+
+        ret_op = func.ReturnOp(errmsg_arg, errflg_arg)
+
+        new_block.add_ops([
+            err_const, store_errflg,
+            *host_var_ref_ops,
+            suite_name_eq,
+            outer_if,
+            ret_op,
+        ])
+
+        body = Region()
+        body.add_block(new_block)
+
+        fn_type = builtin.FunctionType.from_lists(
+            all_block_types,
+            [errmsg_type, errflg_type],
+        )
+        cap_fn = func.FuncOp(fn_name, fn_type, body, visibility="public")
+        decl = func.FuncOp.external(suite_callee, callee_input_types, callee_output_types)
+        decl.attributes["module"] = StringAttr(callee_module)
+        return cap_fn, decl, host_global_ops
+
     def _generate_ccpp_cap_module(self, suite_name, suite_desc, meta_data, public_fns):
         """Build the CCPP cap ModuleOp for one suite.
 
         Generates the lifecycle subroutines inside a module named
-        ``<snake_case>_ccpp_cap``.  Currently produces:
+        ``<snake_case>_ccpp_cap``.  Produces:
           - ``<CamelCase>_ccpp_physics_initialize``
           - ``<CamelCase>_ccpp_physics_finalize``
+          - ``<CamelCase>_ccpp_physics_timestep_initial``
+          - ``<CamelCase>_ccpp_physics_timestep_final``
+          - ``<CamelCase>_ccpp_physics_run``
         """
         camel_name = self._derive_camel_case_name(suite_name)
 
@@ -211,7 +432,7 @@ class CCPPCAP(ModulePass):
         errmsg_type = memref.MemRefType(char_base, [512])
         errflg_type = memref.MemRefType(int_base, [])
 
-        # Shared kwargs for _generate_lifecycle_fn
+        # Shared kwargs for _generate_lifecycle_fn and _generate_run_fn
         common = dict(
             suite_name=suite_name,
             suite_name_type=suite_name_type,
@@ -222,21 +443,41 @@ class CCPPCAP(ModulePass):
             public_fns=public_fns,
         )
 
-        # Each entry: (generated fn name suffix, table postfix, suite callee suffix)
+        # Each entry: (fn suffix, table postfix, callee suffix, suite_part or None)
+        # suite_part=None  → simple lifecycle dispatch (_generate_lifecycle_fn)
+        # suite_part=str   → physics run dispatch (_generate_run_fn)
         lifecycle_specs = [
-            ("_ccpp_physics_initialize", "_init",     "_suite_initialize"),
-            ("_ccpp_physics_finalize",   "_finalize",  "_suite_finalize"),
-            ("_ccpp_physics_timestep_initial",   None,  "_suite_timestep_initial"),
-            ("_ccpp_physics_timestep_final",   None,  "_suite_timestep_final"),
+            ("_ccpp_physics_initialize", "_init",     "_suite_initialize", None),
+            ("_ccpp_physics_finalize",   "_finalize",  "_suite_finalize",  None),
+            ("_ccpp_physics_timestep_initial", None, "_suite_timestep_initial", None),
+            ("_ccpp_physics_timestep_final",   None, "_suite_timestep_final",   None),
+            ("_ccpp_physics_run",               None, "_suite_physics",    "physics"),
         ]
 
         module_ops = []
-        for fn_suffix, table_postfix, callee_suffix in lifecycle_specs:
+        for fn_suffix, table_postfix, callee_suffix, suite_part in lifecycle_specs:
             suite_callee = suite_name + callee_suffix
-            if table_postfix is not None:
+            if suite_part is not None:
+                # Physics run: nested suite_name + suite_part dispatch
+                cap_fn, decl, host_global_ops = self._generate_run_fn(
+                    fn_name=camel_name + fn_suffix,
+                    suite_part=suite_part,
+                    suite_callee=suite_callee,
+                    scheme_names=scheme_names,
+                    meta_data=meta_data,
+                    **common,
+                )
+                module_ops.extend(host_global_ops)
+            elif table_postfix is not None:
                 # Derive return types from the scheme arg tables in the metadata
                 call_ret_types = self._get_suite_lifecycle_return_types(
                     scheme_names, meta_data, table_postfix
+                )
+                cap_fn, decl = self._generate_lifecycle_fn(
+                    fn_name=camel_name + fn_suffix,
+                    suite_callee=suite_callee,
+                    call_ret_types=call_ret_types,
+                    **common,
                 )
             else:
                 # No scheme arg tables for this phase (e.g. timestep_initial).
@@ -246,13 +487,13 @@ class CCPPCAP(ModulePass):
                     f"Suite callee '{suite_callee}' not found; "
                     f"available: {sorted(public_fns)}"
                 )
-                _callee_mod, call_ret_types = public_fns[suite_callee]
-            cap_fn, decl = self._generate_lifecycle_fn(
-                fn_name=camel_name + fn_suffix,
-                suite_callee=suite_callee,
-                call_ret_types=call_ret_types,
-                **common,
-            )
+                _callee_mod, call_ret_types, _, _ = public_fns[suite_callee]
+                cap_fn, decl = self._generate_lifecycle_fn(
+                    fn_name=camel_name + fn_suffix,
+                    suite_callee=suite_callee,
+                    call_ret_types=call_ret_types,
+                    **common,
+                )
             module_ops.extend([cap_fn, decl])
 
         mod_base = suite_name[:-6] if suite_name.endswith("_suite") else suite_name

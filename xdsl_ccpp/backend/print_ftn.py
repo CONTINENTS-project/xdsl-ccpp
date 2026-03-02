@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp
+from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -356,6 +356,15 @@ class ftnPrintContext:
                     self.print(f"{arr_name} = ", end="")
                 self.print_expr(val.owner)
                 self.print("")
+            case CCPPHostVarRefOp():
+                # Register the host variable name for the result — no Fortran emitted
+                self.variables[op.res] = op.var_name.data
+            case CCPPWriteErrMsgOp():
+                dest_name = self._get_variable_name_for(op.dest)
+                var_name = self._get_variable_name_for(op.var)
+                prefix_val = op.prefix.data
+                suffix_val = op.suffix.data
+                self.print(f"write({dest_name}, '(3a)') \"{prefix_val}\", trim({var_name}), \"{suffix_val}\"")
 
     def _print_module(self, module_name, body):
         """Print a builtin.ModuleOp as a Fortran module block.
@@ -372,9 +381,9 @@ class ftnPrintContext:
         self.print(f"module {module_name.data}")
         self.print("\nuse ccpp_kinds", prefix="  ")
 
-        # Emit 'use <module>, only: <procs>' for each external FuncOp that
-        # carries a module attribute (set by generate-ccpp-cap to record
-        # which suite cap module owns the callee).
+        # Emit 'use <module>, only: <name>' lines.  Two sources:
+        #   1. External FuncOps with a 'module' attribute (suite cap callees).
+        #   2. llvm.GlobalOp stubs with a 'module' attribute (host model vars).
         use_map: dict[str, list[str]] = {}
         for op in body.ops:
             if (
@@ -382,6 +391,9 @@ class ftnPrintContext:
                 and op.is_declaration
                 and "module" in op.attributes
             ):
+                mod = op.attributes["module"].data
+                use_map.setdefault(mod, []).append(op.sym_name.data)
+            elif isa(op, llvm.GlobalOp) and "module" in op.attributes:
                 mod = op.attributes["module"].data
                 use_map.setdefault(mod, []).append(op.sym_name.data)
         for mod, procs in sorted(use_map.items()):
@@ -392,9 +404,11 @@ class ftnPrintContext:
         self.print("private", prefix="  ")
         self.print("")
 
-        # Emit module-level character variable declarations for each LLVM global
+        # Emit module-level character variable declarations for each LLVM global.
+        # Globals with a 'module' attribute are USE-associated (already emitted
+        # above as 'use' lines) and must not be re-declared here.
         for op in body.ops:
-            if isa(op, llvm.GlobalOp):
+            if isa(op, llvm.GlobalOp) and "module" not in op.attributes:
                 name = op.sym_name.data
                 val = op.value.data if isa(op.value, StringAttr) else ""
                 is_const = op.constant is not None

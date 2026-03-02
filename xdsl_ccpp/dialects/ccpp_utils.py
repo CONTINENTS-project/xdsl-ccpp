@@ -53,8 +53,67 @@ class StringEqOp(IRDLOperation):
         )
 
 
+@irdl_op_definition
+class HostVarRefOp(IRDLOperation):
+    """SSA reference to a host model module variable.
+
+    Produces an SSA value of the given result type representing `var_name`
+    from `module_name`.  No Fortran code is emitted — the printer registers
+    `var_name` as the variable name for the result so that downstream ops
+    (e.g. call arguments) print the correct host variable name.
+
+    A corresponding llvm.GlobalOp stub (with a 'module' attribute) is placed
+    at the enclosing module level to drive 'use module, only: var' generation.
+    """
+
+    name = "ccpp_utils.host_var_ref"
+
+    var_name = prop_def(StringAttr)
+    module_name = prop_def(StringAttr)
+    res = result_def()  # type set at construction to match callee expectation
+
+    def __init__(self, var_name: str | StringAttr, module_name: str | StringAttr, result_type):
+        if isinstance(var_name, str):
+            var_name = StringAttr(var_name)
+        if isinstance(module_name, str):
+            module_name = StringAttr(module_name)
+        super().__init__(
+            properties={"var_name": var_name, "module_name": module_name},
+            result_types=[result_type],
+        )
+
+
+@irdl_op_definition
+class WriteErrMsgOp(IRDLOperation):
+    """Write a formatted error message into an errmsg buffer.
+
+    dest is a memref<512xi8> (errmsg buffer).
+    var is a memref<?xi8> (the dynamic string part, will be trim()-ed).
+    prefix and suffix are compile-time string literals.
+
+    Printed as: write(dest, '(3a)') "prefix", trim(var), "suffix"
+    """
+
+    name = "ccpp_utils.write_errmsg"
+
+    dest = operand_def()  # memref<512xi8>
+    var = operand_def()   # memref<?xi8>
+    prefix = prop_def(StringAttr)
+    suffix = prop_def(StringAttr)
+
+    def __init__(self, dest, var, prefix: str | StringAttr, suffix: str | StringAttr):
+        if isinstance(prefix, str):
+            prefix = StringAttr(prefix)
+        if isinstance(suffix, str):
+            suffix = StringAttr(suffix)
+        super().__init__(
+            operands=[dest, var],
+            properties={"prefix": prefix, "suffix": suffix},
+        )
+
+
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp, StringEqOp],
+    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp],
     [],
 )
