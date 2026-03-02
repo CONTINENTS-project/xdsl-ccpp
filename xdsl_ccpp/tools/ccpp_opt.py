@@ -4,6 +4,7 @@ import os, glob
 from xdsl.dialects.builtin import ModuleOp
 
 from xdsl_ccpp.transforms.suite_cap import SuiteCAP
+from xdsl_ccpp.transforms.ccpp_cap import CCPPCAP
 from xdsl_ccpp.transforms.suite_meta import MetaCAP
 from xdsl_ccpp.transforms.strip_ccpp import StripCCPP
 from xdsl_ccpp.transforms.lower_ccpp_utils import LowerCCPPUtils
@@ -23,6 +24,7 @@ class CCPPOptMain(xDSLOptMain):
     def register_all_passes(self):
         super().register_all_passes()
         self.register_pass("generate-suite-cap", lambda: SuiteCAP)
+        self.register_pass("generate-ccpp-cap", lambda: CCPPCAP)
         self.register_pass("generate-meta-cap", lambda: MetaCAP)
         self.register_pass("strip-ccpp", lambda: StripCCPP)
         self.register_pass("lower-ccpp-utils", lambda: LowerCCPPUtils)
