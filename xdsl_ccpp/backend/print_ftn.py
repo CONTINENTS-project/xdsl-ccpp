@@ -371,6 +371,22 @@ class ftnPrintContext:
 
         self.print(f"module {module_name.data}")
         self.print("\nuse ccpp_kinds", prefix="  ")
+
+        # Emit 'use <module>, only: <procs>' for each external FuncOp that
+        # carries a module attribute (set by generate-ccpp-cap to record
+        # which suite cap module owns the callee).
+        use_map: dict[str, list[str]] = {}
+        for op in body.ops:
+            if (
+                isa(op, func.FuncOp)
+                and op.is_declaration
+                and "module" in op.attributes
+            ):
+                mod = op.attributes["module"].data
+                use_map.setdefault(mod, []).append(op.sym_name.data)
+        for mod, procs in sorted(use_map.items()):
+            self.print(f"use {mod}, only: {', '.join(sorted(procs))}", prefix="  ")
+
         self.print("\nimplicit none", prefix="  ")
         self.print("private", prefix="  ")
         self.print("")
