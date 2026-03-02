@@ -163,9 +163,14 @@ class CCPPCAP(ModulePass):
             elif ret_type == errflg_type:
                 copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_alloc))
 
+        write_err = WriteErrMsgOp(errmsg_alloc, new_block.args[0], "No suite named ", "found")
+        one_err = arith.ConstantOp.from_int_and_width(1, 32)
+        store_errflg_err = memref.StoreOp.get(one_err, errflg_alloc, [])
+
         if_op = scf.IfOp(
             string_eq_op.res, [],
             [call_op] + copy_ops + [scf.YieldOp()],
+            [write_err, one_err, store_errflg_err, scf.YieldOp()],
         )
 
         ret_op = func.ReturnOp(errmsg_alloc, errflg_alloc)
