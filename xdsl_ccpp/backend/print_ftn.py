@@ -37,25 +37,45 @@ from xdsl.traits import is_side_effect_free
 from xdsl.utils.comparisons import to_unsigned
 from xdsl.utils.hints import isa
 
+
 @dataclass
 class ftnPrintContext:
+    """Stateful context for printing MLIR IR as Fortran source text.
+
+    Each context owns an indentation prefix and a mapping from SSA values to
+    Fortran variable names.  Nested structures (subroutines, if-blocks, etc.)
+    are handled by creating a child context via `descend`, which inherits the
+    current variable map and adds one level of indentation.
+    """
+
     _INDEX = "i32"
     _INDENT = "  "
     output: IO[str]
 
+    # Current indentation string prepended to every line
     _prefix: str = field(default="")
 
+    # Map from SSA value to its Fortran variable name
     variables: dict[SSAValue, str] = field(default_factory=dict[SSAValue, str])
 
+    # Counter used to generate unique fallback variable names
     _counter: int = field(default=0)
 
+    # Maps arith op names to their Fortran infix operator strings
     _binops: dict[str, str] = field(default_factory=dict[str, str])
 
+    # Maps comparison op names to a predicate-string → Fortran-operator dict
     _cmp_ops: dict[str, dict[str, str | None]] = field(
         default_factory=dict[str, dict[str, str | None]]
     )
 
     def register_binops(self):
+        """Populate the binary-operator and comparison-operator lookup tables.
+
+        Must be called once before printing begins.  Kept separate from
+        __init__ so that child contexts created by `descend` can share the
+        already-populated dicts without re-building them.
+        """
         self._binops.update(
             {
                 arith.AddfOp.name: "+",
@@ -110,8 +130,12 @@ class ftnPrintContext:
         )
 
     def _get_variable_name_for(self, val: SSAValue, hint: str | None = None) -> str:
-        """
-        Get an assigned variable name for a given SSA Value
+        """Return the Fortran variable name assigned to an SSA value.
+
+        If the value has already been assigned a name it is returned directly.
+        Otherwise a new name is chosen, preferring the value's name_hint (or
+        the caller-supplied hint), and falling back to a numbered prefix when
+        the hint is absent or already taken.
         """
         if val in self.variables:
             return self.variables[val]
@@ -124,6 +148,7 @@ class ftnPrintContext:
         if hint is not None and hint not in taken_names:
             name = hint
         else:
+            # Generate a unique name using a numeric suffix
             prefix = "v" if val.name_hint is None else val.name_hint
 
             name = f"{prefix}{self._counter}"
@@ -137,21 +162,15 @@ class ftnPrintContext:
         return name
 
     def mlir_type_to_ftn_type(self, type_attr: Attribute) -> str:
-        """
-        Convert an MLR type to a csl type. CSL supports a very limited set of types:
+        """Convert an MLIR type attribute to its Fortran type declaration string.
 
-        - integer types: i16, u16, i32, u32
-        - float types: f16, f32
-        - pointers: [*]f32
-        - arrays: [64]f32
-        - function: fn(i32) f16
-        - color
-        - comptime_struct
-        - imported_module
-        - type
-        - comptime_string
-
-        This method supports all of these except type and comptime_string
+        Supported types:
+          - f32 / f64       → real(kind=4) / real(kind=8)
+          - i1              → logical
+          - i8              → character
+          - i32             → integer
+          - memref<T>       → the Fortran type of T (scalar, no dimensions)
+          - memref<NxT>     → character(len=N) for character, T(N) otherwise
         """
         match type_attr:
             case Float32Type():
@@ -173,21 +192,25 @@ class ftnPrintContext:
                 shape_str = ", ".join(str(s.data) for s in shape)
                 type_str = self.mlir_type_to_ftn_type(elem_t)
                 if not shape_str:
+                    # Zero-dimensional memref — treat as a plain scalar
                     return type_str
                 elif type_str == "character":
+                    # Character length is expressed with len= rather than dimensions
                     return f"{type_str}(len={shape_str})"
                 else:
                     return f"{type_str}({shape_str})"
 
     def attribute_value_to_str(self, attr: Attribute) -> str:
-        """
-        Takes a value-carrying attribute (IntegerAttr, FloatAttr, etc.)
-        and converts it to a csl expression representing that value literal (0, 3.14, ...)
+        """Convert a value-carrying attribute to a Fortran literal string.
+
+        Handles integer, float, string, and dense element attributes.
+        Returns a diagnostic placeholder for unrecognised attribute kinds.
         """
         match attr:
             case IntAttr():
                 return str(cast(IntAttr[int], attr).data)
             case IntegerAttr(value=val, type=IntegerType(width=IntAttr(data=1))):
+                # i1 values are printed as Fortran logical literals
                 return str(bool(val.data)).lower()
             case IntegerAttr(value=val):
                 return str(val.data)
@@ -205,43 +228,37 @@ class ftnPrintContext:
     def _print_or_promote_to_inline_expr(
         self, var: OpResult, value_expr: str, brackets: bool = False
     ):
-        """
-        Given an SSA value (op result) and a string representing its value.
-
-        Check that the result can be promoted to an expression, or if not
-        assign it to a new variable.
-
-        Optionally adds brackets around the value when promoting to expression.
-        """
-        # prevent exploding expression sizes
-        # also check that the expression is safe to promote
-        #if len(value_expr) < 50 and self._can_promote_result_to_inline_expr(var):
-        #    if brackets:
-        #        value_expr = f"({value_expr})"
-        #    self.variables[var] = value_expr
-        #else:
-
+        """Print value_expr directly as an inline expression (no newline)."""
         self.print(f"{value_expr}", end="", use_prefix=False)
 
     def find_ret_ssa_idx(self, ret_op, ssa):
+        """Return the index of ssa in ret_op's argument list, or None."""
         for idx, arg in enumerate(ret_op.arguments):
             if arg == ssa:
                 return idx
         return None
 
-    def print_expr(self, op:Operation):
+    def print_expr(self, op: Operation):
+        """Recursively print op as an inline Fortran expression (no newline).
+
+        Only operations that can appear as sub-expressions are handled here.
+        Statement-level operations are handled by print_op instead.
+        """
         match op:
             case arith.ConstantOp(value=v, result=r):
+                # Emit the literal value of the constant
                 self._print_or_promote_to_inline_expr(r, self.attribute_value_to_str(v))
             case memref.LoadOp(memref=arr, indices=idxs, res=res):
+                # A load from a memref is represented by the variable name itself
                 self.print(self._get_variable_name_for(arr), end="", use_prefix=False)
             case arith.CmpiOp(predicate=v, lhs=l, rhs=r):
-                str_pred=arith.CMPI_COMPARISON_OPERATIONS[v.value.data]
-
+                # Emit lhs <op> rhs using the Fortran comparison operator
+                str_pred = arith.CMPI_COMPARISON_OPERATIONS[v.value.data]
                 self.print_expr(l.owner)
                 self.print(f" {self._cmp_ops[op.name][str_pred]} ", end="", use_prefix=False)
                 self.print_expr(r.owner)
             case arith.XOrIOp():
+                # XOrI(x, 1_i1) is a logical NOT; detect which operand is the constant
                 l, r = op.lhs, op.rhs
                 if isa(r.owner, arith.ConstantOp):
                     self.print(".NOT. (", end="", use_prefix=False)
@@ -252,10 +269,12 @@ class ftnPrintContext:
                     self.print_expr(r.owner)
                     self.print(")", end="", use_prefix=False)
                 else:
+                    # General XOR — emit as logical inequality
                     self.print_expr(l.owner)
                     self.print(" .neqv. ", end="", use_prefix=False)
                     self.print_expr(r.owner)
             case CCPPStrCmpOp():
+                # High-level strcmp: emit as a Fortran character equality test
                 lhs_name = self._get_variable_name_for(op.lhs)
                 rhs_name = self._get_variable_name_for(op.rhs)
                 self.print(f"{lhs_name} .eq. {rhs_name}", end="", use_prefix=False)
@@ -264,29 +283,39 @@ class ftnPrintContext:
                 assert False
 
     def print_op(self, op: Operation):
+        """Dispatch an MLIR operation to the appropriate Fortran printer.
+
+        Operations that produce values but emit no Fortran statement (e.g.
+        address-of, load) register names in the variables dict and return
+        silently.  Operations that have no Fortran equivalent (e.g. alloca,
+        global declarations, yield) are skipped with a pass.
+        """
         match op:
             case builtin.ModuleOp(sym_name=name, body=bdy):
                 self._print_module(name, bdy)
             case memref.AllocaOp():
-                pass  # Registration handled in _print_fn
+                pass  # Variable registration is handled up-front in _print_fn
             case llvm.GlobalOp():
-                pass  # Declarations handled in _print_module
+                pass  # Module-level globals are declared in _print_module preamble
             case llvm.AddressOfOp():
+                # Record the global's name as the variable name for this result
                 self.variables[op.result] = op.global_name.root_reference.data
             case llvm.LoadOp():
+                # Propagate the pointer's name to the loaded value
                 self.variables[op.dereferenced_value] = self._get_variable_name_for(op.ptr)
             case llvm.StoreOp():
+                # Emit a Fortran assignment from the source value to the destination
                 dst_name = self._get_variable_name_for(op.ptr)
                 src_name = self._get_variable_name_for(op.value)
                 self.print(f"{dst_name} = {src_name}")
             case func.FuncOp(sym_name=name, body=bdy, function_type=ftyp):
+                # Skip external declarations; only print subroutine definitions
                 if not op.is_declaration:
                     self._print_fn(name, bdy, ftyp)
             case func.CallOp(callee=tgt, arguments=args, res=results):
                 self._print_call(tgt, args, results)
             case scf.IfOp(cond=conditional, true_region=true_bdy, false_region=false_bdy):
                 self._print_if(conditional, true_bdy, false_bdy)
-
             case memref.StoreOp(value=val, memref=arr, indices=idxs):
                 arr_name = self._get_variable_name_for(arr)
                 idx_args = ", ".join(map(self._get_variable_name_for, idxs))
@@ -299,6 +328,15 @@ class ftnPrintContext:
                 self.print("")
 
     def _print_module(self, module_name, body):
+        """Print a builtin.ModuleOp as a Fortran module block.
+
+        The preamble contains:
+          - use ccpp_kinds / implicit none / private defaults
+          - character variable declarations for every llvm.GlobalOp
+          - a public :: line for each subroutine definition marked public
+        The CONTAINS section follows, with all subroutine definitions printed
+        by delegating to print_block.
+        """
         assert module_name is not None
 
         self.print(f"module {module_name.data}")
@@ -307,16 +345,20 @@ class ftnPrintContext:
         self.print("private", prefix="  ")
         self.print("")
 
+        # Emit module-level character variable declarations for each LLVM global
         for op in body.ops:
             if isa(op, llvm.GlobalOp):
                 name = op.sym_name.data
                 val = op.value.data if isa(op.value, StringAttr) else ""
                 is_const = op.constant is not None
                 if is_const:
+                    # Read-only string constants use the parameter attribute
                     self.print(f"character(len=16), parameter :: {name} = '{val}'", prefix="  ")
                 else:
+                    # Mutable state variable (ccpp_suite_state) has no parameter
                     self.print(f"character(len=16) :: {name} = '{val}'", prefix="  ")
 
+        # Emit one public :: line per subroutine definition that is marked public
         public_procs = [
             op.sym_name.data
             for op in body.ops
@@ -336,16 +378,31 @@ class ftnPrintContext:
         self.print(f"end module {module_name.data}")
 
     def get_call_result_var_ssa(self, res_ssa):
+        """Resolve a call result SSA value to the Fortran variable it writes into.
+
+        After a scheme subroutine call the MLIR IR contains a memref.CopyOp
+        that copies each result into its destination storage.  This method
+        follows that use edge to find the destination variable name, which is
+        then printed as the output argument of the Fortran call.
+        """
         for use in res_ssa.uses:
             if isa(use.operation, memref.CopyOp):
                 return self._get_variable_name_for(use.operation.destination)
 
     def _print_call(self, tgt, args, results):
+        """Print a func.CallOp as a Fortran subroutine call statement.
+
+        Input arguments are printed by variable name.  Output arguments are
+        resolved through the CopyOp use-chain to find the destination variable
+        that will receive each result.
+        """
         self.print(f"call {tgt.string_value()}(", end="")
+        # Print input (in / inout) arguments by their variable names
         for idx, arg in enumerate(args):
             if idx > 0: self.print(", ", end="", use_prefix=False)
             self.print(self._get_variable_name_for(arg), end="", use_prefix=False)
 
+        # Print output argument destinations, resolved via CopyOp uses
         for idx, res in enumerate(results, start=len(args)):
             if idx > 0: self.print(", ", end="", use_prefix=False)
             self.print(self.get_call_result_var_ssa(res), end="", use_prefix=False)
@@ -358,6 +415,7 @@ class ftnPrintContext:
         true_bdy: Region,
         false_bdy: Region,
     ):
+        """Print an scf.IfOp as a Fortran if / else / end if block."""
         self.print("if (", end="")
         self.print_expr(conditional.owner)
         self.print(") then", use_prefix=False)
@@ -378,13 +436,24 @@ class ftnPrintContext:
         bdy: Region,
         ftyp: FunctionType,
     ):
+        """Print a func.FuncOp definition as a Fortran subroutine.
+
+        Argument names are taken from the name_hint set on each block argument
+        and alloca result during IR generation, falling back to positional
+        names if no hint is present.
+
+        The ReturnOp is scanned to detect inout arguments (block args that
+        appear in the return list) so they can be declared intent(inout) rather
+        than the default intent(in).  Pure output arguments come from AllocaOp
+        results also present in the return list.
+        """
         # Collect input arg names from block arg name hints
         input_names = [
             arg.name_hint if arg.name_hint is not None else f"arg_{idx}"
             for idx, arg in enumerate(bdy.block.args)
         ]
 
-        # Scan ReturnOp for output alloca results and detect inout block args
+        # Scan ReturnOp to separate output allocas from returned inout block args
         output_names: list[str] = []
         output_ret_vals: list = []
         inout_block_args: set = set()
@@ -392,10 +461,12 @@ class ftnPrintContext:
             if isa(op, func.ReturnOp):
                 for ret_val in op.arguments:
                     if isa(ret_val.owner, memref.AllocaOp):
+                        # AllocaOp result → a true output argument
                         out_name = ret_val.name_hint if ret_val.name_hint is not None else f"out_{len(output_names)}"
                         output_names.append(out_name)
                         output_ret_vals.append(ret_val)
                     else:
+                        # Block arg in return position → inout argument
                         inout_block_args.add(ret_val)
                 break
 
@@ -404,17 +475,21 @@ class ftnPrintContext:
         end_signature = f"end subroutine {fn_name.data}"
 
         with self.descend(start_signature, end_signature) as inner:
+            # Register input block args so downstream ops can look them up by name
             for arg, arg_name in zip(bdy.block.args, input_names):
                 inner.variables[arg] = arg_name
 
+            # Register output alloca results so StoreOp and CallOp can resolve them
             for ret_val, out_name in zip(output_ret_vals, output_names):
                 inner.variables[ret_val] = out_name
 
+            # Declare input arguments with intent(in) or intent(inout)
             for arg, arg_name in zip(bdy.block.args, input_names):
                 type_str = inner.mlir_type_to_ftn_type(arg.type)
                 intent = "inout" if arg in inout_block_args else "in"
                 inner.print(f"{type_str}, intent({intent}) :: {arg_name}")
 
+            # Declare output arguments with intent(out)
             for ret_val, out_name in zip(output_ret_vals, output_names):
                 type_str = inner.mlir_type_to_ftn_type(ret_val.type)
                 inner.print(f"{type_str}, intent(out) :: {out_name}")
@@ -425,33 +500,24 @@ class ftnPrintContext:
 
     @contextmanager
     def descend(self, block_start: str = None, block_end: str = None):
-        """
-        Get a sub-context for descending into nested structures.
+        """Return a child context with one extra level of indentation.
 
-        Variables defined outside are valid inside, but inside varaibles will be
-        available outside.
+        The child inherits a copy of the parent's variable map so that names
+        defined in an outer scope remain visible inside nested blocks.  An
+        optional block_start string (e.g. a subroutine signature) is printed
+        before yielding, and block_end (e.g. 'end subroutine') is printed
+        after the with-block completes.
 
-        The code printed in this context will be surrounded by curly braces and
-        can optionally start with a `block_start` statement (e.g. function
-        siganture or the `comptime` keyword).
+        Usage::
 
-        To be used in a `with` statement like so:
-        ```
-        with self.descend() as inner_context:
-            inner_context.print()
-        ```
-
-        NOTE: `_symbols_to_export` is passed as a reference, so the sub-context
-        could in theory modify the parent's list of exported symbols, in
-        practice this should not happen as `SymbolExportOp` has been verified to
-        only be present at module scope.
+            with self.descend("subroutine foo()", "end subroutine foo") as inner:
+                inner.print_block(body)
         """
         if block_start is not None:
             self.print(f"{block_start} ")
         yield ftnPrintContext(
             output=self.output,
             variables=self.variables.copy(),
-            #_symbols_to_export=self._symbols_to_export,
             _cmp_ops=self._cmp_ops,
             _binops=self._binops,
             _counter=self._counter,
@@ -461,20 +527,27 @@ class ftnPrintContext:
             self.print(f"{block_end} ")
 
     def print(self, text: str, prefix: str = "", end: str = "\n", use_prefix=True):
-        """
-        Print `text` line by line, prefixed by self._prefix and prefix.
+        """Print text to the output stream, applying the current indentation.
+
+        Multi-line strings are split and each line is prefixed individually.
+        Pass use_prefix=False to suppress indentation (e.g. for continuations
+        on the same line).
         """
         for l in text.split("\n"):
             print((self._prefix + prefix if use_prefix else "") + l, file=self.output, end=end)
 
     def print_block(self, body: Block):
-        """
-        Walks over a block and prints every operation in the block.
-        """
+        """Iterate over every operation in body and dispatch it to print_op."""
         for op in body.ops:
             self.print_op(op)
 
+
 def get_modules_in_module_op(module: ModuleOp):
+    """Yield each named sub-ModuleOp directly contained in the top-level module.
+
+    The top-level module is an anonymous wrapper; the named sub-modules (one
+    per cap suite) are what get printed as individual Fortran files.
+    """
     for op in module.body.ops:
         if isinstance(op, builtin.ModuleOp):
             yield op
@@ -483,12 +556,19 @@ def get_modules_in_module_op(module: ModuleOp):
 def print_to_ftn(
     prog: ModuleOp, output: IO[str], Ctx: type[ftnPrintContext] = ftnPrintContext
 ):
+    """Print all named sub-modules in prog as Fortran source to output.
+
+    Each sub-module is preceded by a FILE comment that indicates the suggested
+    output filename (e.g. '// FILE: hello_world_suite_cap.F90').  Multiple
+    modules are separated by a '// -----' divider.
+    """
     ctx = Ctx(output)
     ctx.register_binops()
     divider = False
+    # Print each cap module as a separate Fortran file section
     for module in get_modules_in_module_op(prog):
         if divider:
             ctx.print("// -----")
         divider = True
-        ctx.print("// FILE: " + module.sym_name.data+".F90")
+        ctx.print("// FILE: " + module.sym_name.data + ".F90")
         ctx.print_op(module)
