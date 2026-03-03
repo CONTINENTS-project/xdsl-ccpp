@@ -8,7 +8,7 @@ from xdsl.ir import Block, Region
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects import ccpp_utils
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StringEqOp, HostVarRefOp, WriteErrMsgOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, SetStringOp
 
 from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPType
 from xdsl_ccpp.transforms.util.typing import TypeConversions
@@ -626,16 +626,18 @@ class CCPPCAP(ModulePass):
                               constant=True, value=StringAttr(sn))
             )
 
-            # Allocate the memref<?xi8> string buffer.
-            # Annotate with 'string_src' so the Fortran printer knows which
-            # module-level global to emit as the assignment RHS.
+            # Allocate the memref<?xi8> string buffer, then load the global
+            # constant and hand it to SetStringOp which the printer uses to
+            # resolve the assignment RHS (e.g. suites(1) = str_hello_world_suite).
             str_len_const = arith.ConstantOp(IntegerAttr(str_len, IndexType()), IndexType())
             str_alloc = memref.AllocOp([str_len_const.result], [], inner_char_type)
-            str_alloc.attributes["string_src"] = StringAttr(str_global_name)
+            addr_op = llvm.AddressOfOp(str_global_name, llvm.LLVMPointerType())
+            load_op = llvm.LoadOp(addr_op, arr_type)
+            set_str_op = SetStringOp(str_alloc.memref, load_op.dereferenced_value)
 
             # Store the memref<?xi8> reference into the allocatable argument
             store_ref_op = memref.StoreOp.get(str_alloc.memref, suite_list_block.args[0], [])
-            body_ops.extend([str_len_const, str_alloc, store_ref_op])
+            body_ops.extend([str_len_const, str_alloc, addr_op, load_op, set_str_op, store_ref_op])
 
         suite_list_block.add_ops([*body_ops, func.ReturnOp()])
         suite_list_region = Region()

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -391,16 +391,19 @@ class ftnPrintContext:
                 self._print_if(conditional, true_bdy, false_bdy)
             case memref.AllocOp():
                 pass  # Heap allocations are emitted via the StoreOp that uses the result
+            case CCPPSetStringOp():
+                # Register the source global name as the variable name for dest
+                # so that the memref.StoreOp into the allocatable can find it.
+                src_name = self._get_variable_name_for(op.src)
+                self.variables[op.dest] = src_name
             case memref.StoreOp(value=val, memref=arr, indices=idxs):
                 if self._is_allocatable_char(arr.type) and isa(val.owner, memref.AllocOp):
                     # Storing a memref<?xi8> (string buffer) into memref<memref<?xi8>>
                     # (the allocatable out arg).  Emit allocate(suites(1)) and then
-                    # assign from the module-level global recorded in the 'string_src'
-                    # attribute of the AllocOp (e.g. suites(1) = str_hello_world_suite).
+                    # assign from the name that SetStringOp registered for val
+                    # (e.g. suites(1) = str_hello_world_suite).
                     arr_name = self._get_variable_name_for(arr)
-                    string_src = None
-                    if "string_src" in val.owner.attributes:
-                        string_src = val.owner.attributes["string_src"].data
+                    string_src = self.variables.get(val)
                     self.print(f"allocate({arr_name}(1))")
                     if string_src is not None:
                         self.print(f"{arr_name}(1) = {string_src}")

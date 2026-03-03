@@ -143,8 +143,30 @@ class ArraySectionOp(IRDLOperation):
         )
 
 
+@irdl_op_definition
+class SetStringOp(IRDLOperation):
+    """Assign a string constant (llvm.array) into a character memref buffer.
+
+    dest is a memref<?xi8> (character buffer).
+    src is an !llvm.array<N x i8> obtained by loading a module-level global
+    via llvm.mlir.addressof + llvm.load.
+
+    No Fortran statement is emitted directly; the printer registers the global
+    name as the variable name for dest so that a downstream memref.StoreOp into
+    an allocatable can emit the correct assignment (e.g. suites(1) = str_name).
+    """
+
+    name = "ccpp_utils.set_string"
+
+    dest = operand_def()  # memref<?xi8>
+    src = operand_def()   # !llvm.array<N x i8>
+
+    def __init__(self, dest, src):
+        super().__init__(operands=[dest, src])
+
+
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp],
+    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, SetStringOp],
     [],
 )
