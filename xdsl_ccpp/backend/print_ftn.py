@@ -167,6 +167,15 @@ class ftnPrintContext:
         self.variables[val] = name
         return name
 
+    @staticmethod
+    def _is_allocatable_char(type_attr: Attribute) -> bool:
+        """Return True if type_attr is memref<memref<?xi8>> (allocatable character array)."""
+        match type_attr:
+            case MemRefType(element_type=MemRefType(element_type=IntegerType(width=IntAttr(data=8)))):
+                return True
+            case _:
+                return False
+
     def mlir_type_to_ftn_type(self, type_attr: Attribute) -> str:
         """Convert an MLIR type attribute to its Fortran type declaration string.
 
@@ -221,6 +230,8 @@ class ftnPrintContext:
         Returns an empty string for scalar types and statically-sized memrefs
         (such as ``character(len=512)``).
         """
+        if self._is_allocatable_char(type_attr):
+            return "(:)"
         match type_attr:
             case MemRefType(element_type=IntegerType(width=IntAttr(data=8)), shape=shape) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:
                 # character(len=*) uses len= notation — no dimension suffix needed
@@ -360,10 +371,16 @@ class ftnPrintContext:
                 # Propagate the pointer's name to the loaded value
                 self.variables[op.dereferenced_value] = self._get_variable_name_for(op.ptr)
             case llvm.StoreOp():
-                # Emit a Fortran assignment from the source value to the destination
-                dst_name = self._get_variable_name_for(op.ptr)
-                src_name = self._get_variable_name_for(op.value)
-                self.print(f"{dst_name} = {src_name}")
+                if isa(op.ptr.type, MemRefType):
+                    # Storing a loaded string value into a memref<?xi8> buffer:
+                    # suppress output here — the Fortran assignment is emitted by
+                    # the memref.StoreOp that places the buffer into the allocatable.
+                    pass
+                else:
+                    # Emit a Fortran assignment from the source value to the destination
+                    dst_name = self._get_variable_name_for(op.ptr)
+                    src_name = self._get_variable_name_for(op.value)
+                    self.print(f"{dst_name} = {src_name}")
             case func.FuncOp(sym_name=name, body=bdy, function_type=ftyp):
                 # Skip external declarations; only print subroutine definitions
                 if not op.is_declaration:
@@ -372,16 +389,30 @@ class ftnPrintContext:
                 self._print_call(tgt, args, results)
             case scf.IfOp(cond=conditional, true_region=true_bdy, false_region=false_bdy):
                 self._print_if(conditional, true_bdy, false_bdy)
+            case memref.AllocOp():
+                pass  # Heap allocations are emitted via the StoreOp that uses the result
             case memref.StoreOp(value=val, memref=arr, indices=idxs):
-                arr_name = self._get_variable_name_for(arr)
-                idx_args = ", ".join(map(self._get_variable_name_for, idxs))
-
-                if len(idx_args) > 0:
-                    self.print(f"{arr_name}[{idx_args}] = ", end="")
+                if self._is_allocatable_char(arr.type) and isa(val.owner, memref.AllocOp):
+                    # Storing a memref<?xi8> (string buffer) into memref<memref<?xi8>>
+                    # (the allocatable out arg).  Emit allocate(suites(1)) and then
+                    # assign from the module-level global recorded in the 'string_src'
+                    # attribute of the AllocOp (e.g. suites(1) = str_hello_world_suite).
+                    arr_name = self._get_variable_name_for(arr)
+                    string_src = None
+                    if "string_src" in val.owner.attributes:
+                        string_src = val.owner.attributes["string_src"].data
+                    self.print(f"allocate({arr_name}(1))")
+                    if string_src is not None:
+                        self.print(f"{arr_name}(1) = {string_src}")
                 else:
-                    self.print(f"{arr_name} = ", end="")
-                self.print_expr(val.owner)
-                self.print("")
+                    arr_name = self._get_variable_name_for(arr)
+                    idx_args = ", ".join(map(self._get_variable_name_for, idxs))
+                    if len(idx_args) > 0:
+                        self.print(f"{arr_name}[{idx_args}] = ", end="")
+                    else:
+                        self.print(f"{arr_name} = ", end="")
+                    self.print_expr(val.owner)
+                    self.print("")
             case CCPPHostVarRefOp():
                 # Register the host variable name for the result — no Fortran emitted
                 self.variables[op.res] = op.var_name.data
@@ -448,21 +479,27 @@ class ftnPrintContext:
                 name = op.sym_name.data
                 val = op.value.data if isa(op.value, StringAttr) else ""
                 is_const = op.constant is not None
+                # Derive character length from the LLVM array type when available
+                char_len: int | str = 16
+                if isa(op.global_type, llvm.LLVMArrayType):
+                    char_len = cast(llvm.LLVMArrayType, op.global_type).size.data
                 if is_const:
                     # Read-only string constants use the parameter attribute
-                    self.print(f"character(len=16), parameter :: {name} = '{val}'", prefix="  ")
+                    self.print(f"character(len={char_len}), parameter :: {name} = '{val}'", prefix="  ")
                 else:
                     # Mutable state variable (ccpp_suite_state) has no parameter
-                    self.print(f"character(len=16) :: {name} = '{val}'", prefix="  ")
+                    self.print(f"character(len={char_len}) :: {name} = '{val}'", prefix="  ")
 
-        # Emit one public :: line per subroutine definition that is marked public
+        # Emit one public :: line per subroutine definition that is marked public.
         public_procs = [
             op.sym_name.data
             for op in body.ops
-            if isa(op, func.FuncOp)
-            and not op.is_declaration
-            and op.sym_visibility is not None
-            and op.sym_visibility.data == "public"
+            if (
+                isa(op, func.FuncOp)
+                and not op.is_declaration
+                and op.sym_visibility is not None
+                and op.sym_visibility.data == "public"
+            )
         ]
         for proc in public_procs:
             self.print(f"public :: {proc}", prefix="  ")
@@ -589,10 +626,15 @@ class ftnPrintContext:
             # Declare input arguments with intent(in) or intent(inout).
             # Array block args (dynamic memref) are always intent(inout): the host
             # provides the buffer and the scheme may write to it in-place.
+            # Exception: memref<memref<?xi8>> is an allocatable character array
+            # passed intent(out) — the callee allocates and fills it.
             for arg, arg_name in zip(bdy.block.args, input_names):
                 type_str = inner.mlir_type_to_ftn_type(arg.type)
                 dim_suffix = inner._ftn_dim_suffix(arg.type)
-                if dim_suffix:
+                if ftnPrintContext._is_allocatable_char(arg.type):
+                    type_str = type_str + ", allocatable"
+                    intent = "out"
+                elif dim_suffix:
                     intent = "inout"
                 elif arg in inout_block_args:
                     intent = "inout"

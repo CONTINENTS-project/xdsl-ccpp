@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from xdsl.dialects import builtin, memref, func, arith, scf, llvm
-from xdsl.dialects.builtin import i8, StringAttr, DYNAMIC_INDEX
+from xdsl.dialects.builtin import i8, StringAttr, DYNAMIC_INDEX, IndexType, IntegerAttr
 from xdsl.context import Context
 from xdsl.passes import ModulePass
 from xdsl.ir import Block, Region
@@ -593,6 +593,57 @@ class CCPPCAP(ModulePass):
                     **common,
                 )
             module_ops.extend([cap_fn, decl])
+
+        # Generate ccpp_physics_suite_list as a func.FuncOp using upstream ops.
+        # The suites argument is memref<memref<?xi8>>: a reference to an
+        # allocatable character(len=*) array, matching Fortran intent(out).
+        #
+        # For each suite name we:
+        #   1. Create an llvm.GlobalOp string constant (like state strings in suite_cap).
+        #   2. Alloc a memref<?xi8> string buffer (→ Fortran allocate(suites(N))).
+        #   3. Load the global via AddressOf + Load, then store it into the buffer
+        #      via llvm.StoreOp (mirroring the state-string assignment pattern).
+        #   4. Store the memref<?xi8> into the allocatable arg (→ suites(i) = ...).
+        inner_char_type = memref.MemRefType(i8, [DYNAMIC_INDEX])
+        allocatable_type = memref.MemRefType(inner_char_type, [])
+        suite_list_block = Block(arg_types=[allocatable_type])
+        suite_list_block.args[0].name_hint = "suites"
+
+        suite_names_list = [suite_name]  # one suite per cap module
+        str_globals = []
+        body_ops = []
+        for sn in suite_names_list:
+            str_global_name = f"str_{sn}"
+            str_len = len(sn)
+            arr_type = llvm.LLVMArrayType.from_size_and_type(str_len, i8)
+
+            # Module-level string constant for the suite name
+            str_globals.append(
+                llvm.GlobalOp(arr_type, str_global_name, "internal",
+                              constant=True, value=StringAttr(sn))
+            )
+
+            # Allocate the memref<?xi8> string buffer.
+            # Annotate with 'string_src' so the Fortran printer knows which
+            # module-level global to emit as the assignment RHS.
+            str_len_const = arith.ConstantOp(IntegerAttr(str_len, IndexType()), IndexType())
+            str_alloc = memref.AllocOp([str_len_const.result], [], inner_char_type)
+            str_alloc.attributes["string_src"] = StringAttr(str_global_name)
+
+            # Store the memref<?xi8> reference into the allocatable argument
+            store_ref_op = memref.StoreOp.get(str_alloc.memref, suite_list_block.args[0], [])
+            body_ops.extend([str_len_const, str_alloc, store_ref_op])
+
+        suite_list_block.add_ops([*body_ops, func.ReturnOp()])
+        suite_list_region = Region()
+        suite_list_region.add_block(suite_list_block)
+        suite_list_fn = func.FuncOp(
+            "ccpp_physics_suite_list",
+            builtin.FunctionType.from_lists([allocatable_type], []),
+            suite_list_region,
+            visibility="public",
+        )
+        module_ops.extend([*str_globals, suite_list_fn])
 
         mod_base = suite_name[:-6] if suite_name.endswith("_suite") else suite_name
         mod_name = mod_base + "_ccpp_cap"
