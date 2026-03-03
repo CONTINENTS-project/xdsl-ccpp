@@ -1,11 +1,13 @@
 from xdsl.dialects.builtin import IntegerAttr, StringAttr, i1, i64
-from xdsl.ir import Dialect
+from xdsl.ir import Dialect, SSAValue
 from xdsl.irdl import (
+    AttrSizedOperandSegments,
     IRDLOperation,
     irdl_op_definition,
     operand_def,
     prop_def,
     result_def,
+    var_operand_def,
 )
 
 
@@ -112,8 +114,37 @@ class WriteErrMsgOp(IRDLOperation):
         )
 
 
+@irdl_op_definition
+class ArraySectionOp(IRDLOperation):
+    """Represent a Fortran array section: source(lower0:upper0, lower1:upper1, ...).
+
+    Used purely for Fortran code generation — no transformation semantics.
+    The result type matches the source type.  The Fortran printer resolves the
+    result to 'source_name(lower0:upper0, lower1:upper1)' so that downstream
+    call ops emit the correct Fortran array-section notation.
+
+    lowers and uppers must have the same length (one pair per dimension).
+    """
+
+    name = "ccpp_utils.array_section"
+
+    source = operand_def()
+    lowers = var_operand_def()
+    uppers = var_operand_def()
+    res = result_def()
+
+    irdl_options = [AttrSizedOperandSegments()]
+
+    def __init__(self, source, lowers, uppers):
+        source_val = SSAValue.get(source)
+        super().__init__(
+            operands=[source, list(lowers), list(uppers)],
+            result_types=[source_val.type],
+        )
+
+
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp],
+    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp],
     [],
 )

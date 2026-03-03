@@ -143,6 +143,8 @@ class ArgumentOp(IRDLOperation):
     long_name = opt_prop_def(StringAttr)
     # Number of array dimensions (0 = scalar). Stored as IntAttr.
     dimensions = opt_prop_def(IntAttr)
+    # Comma-separated dimension standard names, e.g. "horizontal_dimension,vertical_layer_dimension"
+    dim_names = opt_prop_def(StringAttr)
     kind = opt_prop_def(StringAttr)
     intent = opt_prop_def(StringAttr)
     units = opt_prop_def(StringAttr)
@@ -162,9 +164,18 @@ class ArgumentOp(IRDLOperation):
         # Parse the dimensions tuple string, e.g. "(ncol, lev)" → 2 dimensions
         if "dimensions" in prop_keys:
             dim_str = attributes["dimensions"].strip().strip("()")
-            ndims = len([d for d in dim_str.split(",") if d.strip()]) if dim_str.strip() else 0
+            dim_parts = [d.strip() for d in dim_str.split(",") if d.strip()] if dim_str.strip() else []
+            ndims = len(dim_parts)
             if ndims > 0:
                 properties["dimensions"] = IntAttr(ndims)
+                # Store dimension standard names (handle range notation like
+                # 'ccpp_constant_one:horizontal_loop_extent' → take upper bound)
+                parsed_dims = []
+                for d in dim_parts:
+                    if ":" in d:
+                        d = d.split(":")[1].strip()
+                    parsed_dims.append(d)
+                properties["dim_names"] = StringAttr(",".join(parsed_dims))
             prop_keys.remove("dimensions")
 
         known_props=["standard_name", "long_name", "kind", "intent", "units"]

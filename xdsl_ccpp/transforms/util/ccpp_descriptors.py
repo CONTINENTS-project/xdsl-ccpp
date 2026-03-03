@@ -286,6 +286,10 @@ class BuildMetaDataDescriptions(Visitor):
         if "dimensions" in arg_op.properties:
             arg.setAttr("dimensions", arg_op.properties["dimensions"].data)
 
+        # dim_names is a comma-separated StringAttr of dimension standard names
+        if "dim_names" in arg_op.properties:
+            arg.setAttr("dim_names", arg_op.properties["dim_names"].data.split(","))
+
         # 'optional' is a flag attribute — store as a boolean rather than a string
         if "optional" in arg_op.properties:
             arg["optional"] = True

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -262,6 +262,18 @@ class ftnPrintContext:
         """Print value_expr directly as an inline expression (no newline)."""
         self.print(f"{value_expr}", end="", use_prefix=False)
 
+    def _value_to_expr_str(self, val: SSAValue) -> str:
+        """Return the Fortran expression string for an SSA value without printing.
+
+        Checks the variable map first, then falls back to reading the literal
+        value for arith.ConstantOp results, and finally generates a fresh name.
+        """
+        if val in self.variables:
+            return self.variables[val]
+        if isa(val.owner, arith.ConstantOp):
+            return self.attribute_value_to_str(val.owner.value)
+        return self._get_variable_name_for(val)
+
     def find_ret_ssa_idx(self, ret_op, ssa):
         """Return the index of ssa in ret_op's argument list, or None."""
         for idx, arg in enumerate(ret_op.arguments):
@@ -379,6 +391,16 @@ class ftnPrintContext:
                 prefix_val = op.prefix.data
                 suffix_val = op.suffix.data
                 self.print(f"write({dest_name}, '(3a)') \"{prefix_val}\", trim({var_name}), \"{suffix_val}\"")
+            case CCPPArraySectionOp():
+                # Register the full Fortran array-section expression as the
+                # result's variable name so call-site printing emits it inline.
+                source_name = self._value_to_expr_str(op.source)
+                parts = []
+                for lower, upper in zip(op.lowers, op.uppers):
+                    lower_str = self._value_to_expr_str(lower)
+                    upper_str = self._value_to_expr_str(upper)
+                    parts.append(f"{lower_str}:{upper_str}")
+                self.variables[op.res] = f"{source_name}({', '.join(parts)})"
 
     def _print_module(self, module_name, body):
         """Print a builtin.ModuleOp as a Fortran module block.

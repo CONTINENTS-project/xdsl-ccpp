@@ -8,7 +8,7 @@ from xdsl.ir import Block, Region
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects import ccpp_utils
-from xdsl_ccpp.dialects.ccpp_utils import StringEqOp, HostVarRefOp, WriteErrMsgOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StringEqOp, HostVarRefOp, WriteErrMsgOp
 
 from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPType
 from xdsl_ccpp.transforms.util.typing import TypeConversions
@@ -317,6 +317,11 @@ class CCPPCAP(ModulePass):
         host_global_ops = []
         seen_host_globals: set = set()
 
+        # Reverse map: host_var_name → SSA result of its HostVarRefOp.
+        # Built alongside host_var_ref_results so that ArraySectionOps can
+        # look up bound variables (e.g. "pverp") by their host variable name.
+        host_name_to_ref_result = {}
+
         for i, (arg_name, arg_type) in enumerate(zip(callee_input_names, callee_input_types)):
             src = physics_arg_sources[i]
             if src[0] != "host":
@@ -325,6 +330,7 @@ class CCPPCAP(ModulePass):
             ref_op = HostVarRefOp(host_var_name, host_module_name, arg_type)
             host_var_ref_ops.append(ref_op)
             host_var_ref_results[arg_name] = ref_op.res
+            host_name_to_ref_result[host_var_name] = ref_op.res
 
             key = (host_var_name, host_module_name)
             if key not in seen_host_globals:
@@ -337,7 +343,94 @@ class CCPPCAP(ModulePass):
                 glob.attributes["module"] = StringAttr(host_module_name)
                 host_global_ops.append(glob)
 
-        # Build call args in callee order (mix of host refs and block args).
+        # ── ArraySectionOps for multi-dimensional host arrays ─────────────────
+        # For each host variable whose module metadata has 'horizontal_dimension'
+        # as its first dimension, wrap its HostVarRefOp result in an
+        # ArraySectionOp encoding the Fortran slice col_start:col_end for dim 0
+        # and 1:<dim_var> for each subsequent dimension.
+        array_section_pre_ops = []   # constant-1 op (created at most once)
+        array_section_extra_ops = [] # extra HostVarRefOps for dim bounds
+        array_section_main_ops = []  # ArraySectionOps
+        one_const_for_sections = None
+
+        for i, (arg_name, arg_type) in enumerate(zip(callee_input_names, callee_input_types)):
+            src = physics_arg_sources[i]
+            if src[0] != "host":
+                continue
+            _, host_var_name, host_module_name = src
+
+            # Look up module variable descriptor to get dimension standard names
+            try:
+                mod_arg_table = meta_data[host_module_name].getArgTable(host_module_name)
+                host_var_desc = mod_arg_table.getFunctionArgument(host_var_name)
+            except (KeyError, AssertionError):
+                continue
+
+            if not host_var_desc.hasAttr("dim_names"):
+                continue
+            dim_names_list = host_var_desc.getAttr("dim_names")
+            if not dim_names_list or dim_names_list[0] != "horizontal_dimension":
+                continue
+
+            # col_start and col_end must be non-host block args
+            if "col_start" not in block_arg_map or "col_end" not in block_arg_map:
+                continue
+
+            lowers = [block_arg_map["col_start"]]
+            uppers = [block_arg_map["col_end"]]
+
+            # Build bounds for remaining (vertical) dimensions
+            valid = True
+            for dim_std_name in dim_names_list[1:]:
+                if dim_std_name not in host_var_map:
+                    valid = False
+                    break
+                dim_var_name, dim_module_name = host_var_map[dim_std_name]
+
+                if dim_var_name in host_name_to_ref_result:
+                    dim_upper_ref = host_name_to_ref_result[dim_var_name]
+                else:
+                    # Need a fresh HostVarRefOp for this dimension variable
+                    dim_ref_op = HostVarRefOp(
+                        dim_var_name, dim_module_name,
+                        TypeConversions.getBaseType("integer"),
+                    )
+                    array_section_extra_ops.append(dim_ref_op)
+                    host_name_to_ref_result[dim_var_name] = dim_ref_op.res
+                    dim_upper_ref = dim_ref_op.res
+                    # Register as a global for 'use' statement generation
+                    key = (dim_var_name, dim_module_name)
+                    if key not in seen_host_globals:
+                        seen_host_globals.add(key)
+                        dim_glob = llvm.GlobalOp(
+                            llvm.LLVMArrayType.from_size_and_type(1, i8),
+                            dim_var_name,
+                            "external",
+                        )
+                        dim_glob.attributes["module"] = StringAttr(dim_module_name)
+                        host_global_ops.append(dim_glob)
+
+                if one_const_for_sections is None:
+                    one_const_for_sections = arith.ConstantOp.from_int_and_width(1, 32)
+                    array_section_pre_ops.append(one_const_for_sections)
+
+                lowers.append(one_const_for_sections.result)
+                uppers.append(dim_upper_ref)
+
+            if not valid or len(lowers) < 2:
+                continue
+
+            section = ArraySectionOp(
+                host_var_ref_results[arg_name],
+                lowers,
+                uppers,
+            )
+            array_section_main_ops.append(section)
+            host_var_ref_results[arg_name] = section.res
+
+        array_section_ops = array_section_pre_ops + array_section_extra_ops + array_section_main_ops
+
+        # Build call args in callee order (mix of host refs / sections and block args).
         call_args = []
         for i, arg_name in enumerate(callee_input_names):
             if physics_arg_sources[i][0] == "host":
@@ -394,6 +487,7 @@ class CCPPCAP(ModulePass):
         new_block.add_ops([
             err_const, store_errflg,
             *host_var_ref_ops,
+            *array_section_ops,
             suite_name_eq,
             outer_if,
             ret_op,
