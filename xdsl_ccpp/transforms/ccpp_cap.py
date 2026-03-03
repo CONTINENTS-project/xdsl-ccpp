@@ -552,7 +552,10 @@ class CCPPCAP(ModulePass):
             ("_ccpp_physics_run",               None, "_suite_physics",    "physics"),
         ]
 
-        module_ops = []
+        all_globals: list = []
+        all_definitions: list = []
+        all_declarations: list = []
+
         for fn_suffix, table_postfix, callee_suffix, suite_part in lifecycle_specs:
             suite_callee = suite_name + callee_suffix
             if suite_part is not None:
@@ -565,7 +568,7 @@ class CCPPCAP(ModulePass):
                     meta_data=meta_data,
                     **common,
                 )
-                module_ops.extend(host_global_ops)
+                all_globals.extend(host_global_ops)
             elif table_postfix is not None:
                 # Derive return types from the scheme arg tables in the metadata
                 call_ret_types = self._get_suite_lifecycle_return_types(
@@ -592,7 +595,8 @@ class CCPPCAP(ModulePass):
                     call_ret_types=call_ret_types,
                     **common,
                 )
-            module_ops.extend([cap_fn, decl])
+            all_definitions.append(cap_fn)
+            all_declarations.append(decl)
 
         # Generate ccpp_physics_suite_list as a func.FuncOp using upstream ops.
         # The suites argument is memref<memref<?xi8>>: a reference to an
@@ -601,16 +605,15 @@ class CCPPCAP(ModulePass):
         # For each suite name we:
         #   1. Create an llvm.GlobalOp string constant (like state strings in suite_cap).
         #   2. Alloc a memref<?xi8> string buffer (→ Fortran allocate(suites(N))).
-        #   3. Load the global via AddressOf + Load, then store it into the buffer
-        #      via llvm.StoreOp (mirroring the state-string assignment pattern).
-        #   4. Store the memref<?xi8> into the allocatable arg (→ suites(i) = ...).
+        #   3. Annotate the AllocOp with 'string_src' so the printer emits the
+        #      assignment (suites(i) = str_<suite_name>).
+        #   4. Store the memref<?xi8> into the allocatable arg.
         inner_char_type = memref.MemRefType(i8, [DYNAMIC_INDEX])
         allocatable_type = memref.MemRefType(inner_char_type, [])
         suite_list_block = Block(arg_types=[allocatable_type])
         suite_list_block.args[0].name_hint = "suites"
 
         suite_names_list = [suite_name]  # one suite per cap module
-        str_globals = []
         body_ops = []
         for sn in suite_names_list:
             str_global_name = f"str_{sn}"
@@ -618,7 +621,7 @@ class CCPPCAP(ModulePass):
             arr_type = llvm.LLVMArrayType.from_size_and_type(str_len, i8)
 
             # Module-level string constant for the suite name
-            str_globals.append(
+            all_globals.append(
                 llvm.GlobalOp(arr_type, str_global_name, "internal",
                               constant=True, value=StringAttr(sn))
             )
@@ -643,7 +646,9 @@ class CCPPCAP(ModulePass):
             suite_list_region,
             visibility="public",
         )
-        module_ops.extend([*str_globals, suite_list_fn])
+        all_definitions.append(suite_list_fn)
+
+        module_ops = all_globals + all_definitions + all_declarations
 
         mod_base = suite_name[:-6] if suite_name.endswith("_suite") else suite_name
         mod_name = mod_base + "_ccpp_cap"
