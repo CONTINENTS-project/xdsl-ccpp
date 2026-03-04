@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xdsl-ccpp"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "xdsl==0.56.1",
+]
+
+[project.scripts]
+ccpp_xdsl = "xdsl_ccpp.tools.ccpp_dsl:main"
