@@ -134,6 +134,51 @@ class ArgumentTableOp(TableBaseOp):
     name = "ccpp.arg_table"
 
 @irdl_op_definition
+class KindOp(IRDLOperation):
+    """A single named kind entry within a ccpp.kinds block.
+
+    Represents one Fortran kind parameter discovered from the scheme metadata,
+    e.g. ``kind_phys``.  The ``name`` property holds the Fortran identifier and
+    ``value`` holds its corresponding definition (may be the same string when
+    only the name is known from the metadata).
+    """
+
+    name = "ccpp.kind"
+
+    kind_name = prop_def(StringAttr, prop_name="name")
+    kind_value = prop_def(StringAttr, prop_name="value")
+
+    def __init__(self, kind_name: str | StringAttr, kind_value: str | StringAttr):
+        if isa(kind_name, str):
+            kind_name = StringAttr(kind_name)
+        if isa(kind_value, str):
+            kind_value = StringAttr(kind_value)
+        super().__init__(properties={"name": kind_name, "value": kind_value})
+
+
+@irdl_op_definition
+class KindsOp(IRDLOperation):
+    """Container for all real kind parameters discovered in the scheme metadata.
+
+    Placed at the top of the ``@ccpp`` named module by the ``generate-meta-kinds``
+    pass.  Its single-block body holds one `KindOp` per unique kind name found
+    across all ``ccpp.arg`` ops whose type is ``real``.  The op is omitted
+    entirely when no real kinds are present.
+    """
+
+    name = "ccpp.kinds"
+
+    body = region_def("single_block")
+
+    traits = traits_def(
+        NoTerminator(),
+    )
+
+    def __init__(self, kind_ops: Sequence[Operation]):
+        super().__init__(regions=[kind_ops])
+
+
+@irdl_op_definition
 class ArgumentOp(IRDLOperation):
     name = "ccpp.arg"
 
@@ -201,6 +246,8 @@ CCPP = Dialect(
         SuiteOp,
         GroupOp,
         SchemeOp,
+        KindOp,
+        KindsOp,
         TablePropertiesOp,
         ArgumentTableOp,
         ArgumentOp,
