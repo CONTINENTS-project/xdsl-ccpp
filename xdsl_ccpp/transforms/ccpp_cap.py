@@ -505,6 +505,94 @@ class CCPPCAP(ModulePass):
         decl.attributes["module"] = StringAttr(callee_module)
         return cap_fn, decl, host_global_ops
 
+    def _generate_suite_part_list_fn(
+        self, suite_name, part_names,
+        inner_char_type, allocatable_type,
+        suite_name_type, errmsg_type, errflg_type,
+        char_base, int_base,
+    ):
+        """Build the ccpp_physics_suite_part_list FuncOp and its global string ops.
+
+        Generates a subroutine that takes suite_name (assumed-length character,
+        intent(in)) and part_list (allocatable character array, intent(out)) and
+        fills part_list with the physics suite part names for the given suite.
+
+        Returns (FuncOp, list[llvm.GlobalOp]) — the global string constants are
+        returned separately so the caller can add them to all_globals.
+        """
+        part_global_ops = []
+        part_global_names: dict = {}  # part_name -> (str_global_name, arr_type)
+        for pn in part_names:
+            str_global_name = f"str_{pn}"
+            arr_type = llvm.LLVMArrayType.from_size_and_type(len(pn), i8)
+            part_global_ops.append(
+                llvm.GlobalOp(arr_type, str_global_name, "internal",
+                              constant=True, value=StringAttr(pn))
+            )
+            part_global_names[pn] = (str_global_name, arr_type)
+
+        new_block = Block(arg_types=[suite_name_type, allocatable_type])
+        new_block.args[0].name_hint = "suite_name"
+        new_block.args[1].name_hint = "part_list"
+
+        errmsg_alloc = memref.AllocaOp.get(char_base, shape=[512])
+        errmsg_alloc.memref.name_hint = "errmsg"
+        errflg_alloc = memref.AllocaOp.get(int_base, shape=[])
+        errflg_alloc.memref.name_hint = "errflg"
+
+        err_const = arith.ConstantOp.from_int_and_width(0, 32)
+        store_errflg = memref.StoreOp.get(err_const, errflg_alloc, [])
+
+        string_eq_op = StringEqOp(new_block.args[0], suite_name)
+
+        # True branch: for each part name, alloc a string buffer, load the
+        # global constant via AddressOf + Load, assign via SetStringOp, then
+        # store the buffer reference into part_list.
+        true_ops = []
+        for pn in part_names:
+            str_global_name, arr_type = part_global_names[pn]
+            str_len_const = arith.ConstantOp(IntegerAttr(len(pn), IndexType()), IndexType())
+            str_alloc = memref.AllocOp([str_len_const.result], [], inner_char_type)
+            addr_op = llvm.AddressOfOp(str_global_name, llvm.LLVMPointerType())
+            load_op = llvm.LoadOp(addr_op, arr_type)
+            set_str_op = SetStringOp(str_alloc.memref, load_op.dereferenced_value)
+            store_ref_op = memref.StoreOp.get(str_alloc.memref, new_block.args[1], [])
+            true_ops.extend([str_len_const, str_alloc, addr_op, load_op, set_str_op, store_ref_op])
+        true_ops.append(scf.YieldOp())
+
+        # False branch: error
+        write_err = WriteErrMsgOp(errmsg_alloc, new_block.args[0], "No suite named ", " found")
+        one_err = arith.ConstantOp.from_int_and_width(1, 32)
+        store_errflg_err = memref.StoreOp.get(one_err, errflg_alloc, [])
+
+        if_op = scf.IfOp(
+            string_eq_op.res, [],
+            true_ops,
+            [write_err, one_err, store_errflg_err, scf.YieldOp()],
+        )
+
+        ret_op = func.ReturnOp(errmsg_alloc, errflg_alloc)
+
+        new_block.add_ops([
+            errmsg_alloc, errflg_alloc,
+            err_const, store_errflg,
+            string_eq_op,
+            if_op,
+            ret_op,
+        ])
+
+        body = Region()
+        body.add_block(new_block)
+
+        fn_type = builtin.FunctionType.from_lists(
+            [suite_name_type, allocatable_type],
+            [errmsg_type, errflg_type],
+        )
+        suite_part_list_fn = func.FuncOp(
+            "ccpp_physics_suite_part_list", fn_type, body, visibility="public"
+        )
+        return suite_part_list_fn, part_global_ops
+
     def _generate_ccpp_cap_module(self, suite_name, suite_desc, meta_data, public_fns):
         """Build the CCPP cap ModuleOp for one suite.
 
@@ -649,6 +737,27 @@ class CCPPCAP(ModulePass):
             visibility="public",
         )
         all_definitions.append(suite_list_fn)
+
+        # Generate ccpp_physics_suite_part_list.
+        # Part names are the distinct suite_part values from the lifecycle specs.
+        part_names = list(dict.fromkeys(
+            suite_part
+            for _, _, _, suite_part in lifecycle_specs
+            if suite_part is not None
+        ))
+        suite_part_list_fn, part_global_ops = self._generate_suite_part_list_fn(
+            suite_name=suite_name,
+            part_names=part_names,
+            inner_char_type=inner_char_type,
+            allocatable_type=allocatable_type,
+            suite_name_type=suite_name_type,
+            errmsg_type=errmsg_type,
+            errflg_type=errflg_type,
+            char_base=char_base,
+            int_base=int_base,
+        )
+        all_globals.extend(part_global_ops)
+        all_definitions.append(suite_part_list_fn)
 
         module_ops = all_globals + all_definitions + all_declarations
 
