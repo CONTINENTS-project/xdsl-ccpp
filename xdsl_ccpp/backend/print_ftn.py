@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, KindDefOp as CCPPKindDefOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -393,6 +393,8 @@ class ftnPrintContext:
                 self._print_if(conditional, true_bdy, false_bdy)
             case memref.AllocOp():
                 pass  # Heap allocations are emitted via the StoreOp that uses the result
+            case CCPPKindDefOp():
+                pass  # Kind definitions are declared in _print_module preamble
             case CCPPSetStringOp():
                 # Register the source global name as the variable name for dest
                 # so that the memref.StoreOp into the allocatable can find it.
@@ -438,20 +440,42 @@ class ftnPrintContext:
                     parts.append(f"{lower_str}:{upper_str}")
                 self.variables[op.res] = f"{source_name}({', '.join(parts)})"
 
+    # ISO_FORTRAN_ENV named constants recognised as kind values
+    _ISO_FORTRAN_ENV_KINDS: frozenset[str] = frozenset({
+        "REAL32", "REAL64", "REAL128",
+        "INT8", "INT16", "INT32", "INT64",
+    })
+
     def _print_module(self, module_name, body):
         """Print a builtin.ModuleOp as a Fortran module block.
 
         The preamble contains:
-          - use ccpp_kinds / implicit none / private defaults
+          - use ccpp_kinds (skipped for the ccpp_kinds module itself)
+          - use iso_fortran_env if any KindDefOp values are ISO constants
+          - use <module>, only: <name> lines for external declarations
+          - implicit none / private defaults
+          - integer, parameter declarations for every KindDefOp
           - character variable declarations for every llvm.GlobalOp
           - a public :: line for each subroutine definition marked public
-        The CONTAINS section follows, with all subroutine definitions printed
-        by delegating to print_block.
+        The CONTAINS section follows only when subroutine definitions are present.
         """
         assert module_name is not None
+        is_kinds_module = module_name.data == "ccpp_kinds"
 
         self.print(f"module {module_name.data}")
-        self.print("\nuse ccpp_kinds", prefix="  ")
+
+        # The ccpp_kinds module must not use itself (circular dependency)
+        if not is_kinds_module:
+            self.print("\nuse ccpp_kinds", prefix="  ")
+
+        # Emit 'use iso_fortran_env, only: ...' for any ISO kind values present
+        iso_uses = sorted(
+            op.kind_value.data
+            for op in body.ops
+            if isa(op, CCPPKindDefOp) and op.kind_value.data in self._ISO_FORTRAN_ENV_KINDS
+        )
+        if iso_uses:
+            self.print(f"use iso_fortran_env, only: {', '.join(iso_uses)}", prefix="  ")
 
         # Emit 'use <module>, only: <name>' lines.  Two sources:
         #   1. External FuncOps with a 'module' attribute (suite cap callees).
@@ -475,6 +499,14 @@ class ftnPrintContext:
         self.print("\nimplicit none", prefix="  ")
         self.print("private", prefix="  ")
         self.print("")
+
+        # Emit kind parameter declarations (ccpp_kinds module)
+        for op in body.ops:
+            if isa(op, CCPPKindDefOp):
+                self.print(
+                    f"integer, parameter, public :: {op.kind_name.data} = {op.kind_value.data}",
+                    prefix="  ",
+                )
 
         # Emit module-level character variable declarations for each LLVM global.
         # Globals with a 'module' attribute are USE-associated (already emitted
@@ -509,10 +541,14 @@ class ftnPrintContext:
         for proc in public_procs:
             self.print(f"public :: {proc}", prefix="  ")
 
-        self.print("\nCONTAINS")
-
-        with self.descend() as inner:
-            inner.print_block(body)
+        # Only emit CONTAINS when there are subroutine definitions to print
+        has_func_defs = any(
+            isa(op, func.FuncOp) and not op.is_declaration for op in body.ops
+        )
+        if has_func_defs:
+            self.print("\nCONTAINS")
+            with self.descend() as inner:
+                inner.print_block(body)
 
         self.print(f"end module {module_name.data}")
 

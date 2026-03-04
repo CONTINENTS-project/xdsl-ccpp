@@ -163,6 +163,29 @@ class RealKindType(ParametrizedAttribute, TypeAttribute):
 
 
 @irdl_op_definition
+class KindDefOp(IRDLOperation):
+    """Declare a named Fortran kind parameter in the @ccpp_kinds module.
+
+    Represents one ``integer, parameter :: kind_name = kind_value`` line in the
+    generated ``ccpp_kinds`` Fortran module.  Both properties are strings:
+    ``kind_name`` is the Fortran identifier (e.g. ``kind_phys``) and
+    ``kind_value`` is its definition (e.g. ``REAL64`` from iso_fortran_env).
+    """
+
+    name = "ccpp_utils.kind_def"
+
+    kind_name = prop_def(StringAttr)
+    kind_value = prop_def(StringAttr)
+
+    def __init__(self, kind_name: str | StringAttr, kind_value: str | StringAttr):
+        if isinstance(kind_name, str):
+            kind_name = StringAttr(kind_name)
+        if isinstance(kind_value, str):
+            kind_value = StringAttr(kind_value)
+        super().__init__(properties={"kind_name": kind_name, "kind_value": kind_value})
+
+
+@irdl_op_definition
 class SetStringOp(IRDLOperation):
     """Assign a string constant (llvm.array) into a character memref buffer.
 
@@ -186,6 +209,6 @@ class SetStringOp(IRDLOperation):
 
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, SetStringOp],
+    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, KindDefOp, SetStringOp],
     [RealKindType],
 )

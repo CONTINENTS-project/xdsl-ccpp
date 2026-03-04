@@ -130,7 +130,7 @@ class ccppMain:
             ccpp_cap_pass += f"{{host_name={self.options_db['host_name']}}}"
         cmd = (
             f'python3 -m xdsl_ccpp.tools.ccpp_opt "{mlir_in}"'
-            f" -p generate-meta-cap,generate-meta-kinds,generate-suite-cap,{ccpp_cap_pass},strip-ccpp"
+            f" -p generate-meta-cap,generate-meta-kinds,generate-suite-cap,{ccpp_cap_pass},generate-kinds,strip-ccpp"
             f' -t ftn > "{ftn_out}"'
         )
         self.print_verbose_message(
