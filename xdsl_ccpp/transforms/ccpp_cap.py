@@ -8,7 +8,7 @@ from xdsl.ir import Block, Region
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects import ccpp_utils
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, SetStringOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StrCmpOp, HostVarRefOp, WriteErrMsgOp, SetStringOp
 
 from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPType
 from xdsl_ccpp.transforms.util.typing import TypeConversions
@@ -157,7 +157,7 @@ class CCPPCAP(ModulePass):
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
         store_errflg = memref.StoreOp.get(err_const, errflg_alloc, [])
 
-        string_eq_op = StringEqOp(new_block.args[0], suite_name)
+        string_eq_op = StrCmpOp(new_block.args[0], literal=suite_name)
 
         call_op = func.CallOp(suite_callee, [], call_ret_types)
 
@@ -221,7 +221,7 @@ class CCPPCAP(ModulePass):
           4. Emits ``llvm.GlobalOp`` stubs (with a ``module`` attribute) for
              each host variable so the Fortran printer generates the correct
              ``use <module>, only: <var>`` statements.
-          5. Nests two ``StringEqOp`` comparisons: outer on ``suite_name``,
+          5. Nests two ``StrCmpOp`` comparisons: outer on ``suite_name``,
              inner on ``suite_part``.
           6. Emits ``WriteErrMsgOp`` in both else branches.
 
@@ -447,8 +447,8 @@ class CCPPCAP(ModulePass):
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
         store_errflg = memref.StoreOp.get(err_const, errflg_arg, [])
 
-        suite_name_eq = StringEqOp(suite_name_arg, suite_name)
-        suite_part_eq = StringEqOp(suite_part_arg, suite_part)
+        suite_name_eq = StrCmpOp(suite_name_arg, literal=suite_name)
+        suite_part_eq = StrCmpOp(suite_part_arg, literal=suite_part)
 
         call_op = func.CallOp(suite_callee, call_args, callee_output_types)
 
@@ -548,7 +548,7 @@ class CCPPCAP(ModulePass):
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
         store_errflg = memref.StoreOp.get(err_const, errflg_alloc, [])
 
-        string_eq_op = StringEqOp(new_block.args[0], suite_name)
+        string_eq_op = StrCmpOp(new_block.args[0], literal=suite_name)
 
         # True branch: for each part name, alloc a string buffer, load the
         # global constant via AddressOf + Load, assign via SetStringOp, then

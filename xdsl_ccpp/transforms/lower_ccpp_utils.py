@@ -18,6 +18,8 @@ from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp
 class LowerStrCmp(RewritePattern):
     @op_type_rewrite_pattern
     def match_and_rewrite(self, op: StrCmpOp, rewriter: PatternRewriter):
+        if op.rhs is None or op.length is None:
+            return
         length = op.length.value.data
 
         new_ops = []

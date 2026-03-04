@@ -1,12 +1,14 @@
 from xdsl.dialects.builtin import IntegerAttr, IntegerType, MemRefType, StringAttr, i1, i64
 from xdsl.dialects.llvm import LLVMArrayType
-from xdsl.ir import Dialect, ParametrizedAttribute, SSAValue, TypeAttribute
+from xdsl.ir import Dialect, ParametrizedAttribute, SSAValue, TypeAttribute, VerifyException
 from xdsl.irdl import (
     AttrSizedOperandSegments,
     IRDLOperation,
     irdl_attr_definition,
     irdl_op_definition,
     operand_def,
+    opt_operand_def,
+    opt_prop_def,
     param_def,
     prop_def,
     result_def,
@@ -33,44 +35,48 @@ class RealKindType(ParametrizedAttribute, TypeAttribute):
 
 @irdl_op_definition
 class StrCmpOp(IRDLOperation):
-    name = "ccpp_utils.strcmp"
+    """String equality comparison.
 
-    lhs = operand_def(LLVMArrayType)  # !llvm.array<N x i8>
-    rhs = operand_def(LLVMArrayType)  # !llvm.array<M x i8>
-    length = prop_def(IntegerAttr)  # number of bytes to compare
-    res = result_def(i1)  # 1 if equal, 0 if not
+    Two modes (enforced by verify_):
+      - rhs/length mode: lhs and rhs are LLVMArrayType or MemRefType buffers;
+        length is the number of bytes to compare.  literal must be absent.
+        Emitted as: lhs .eq. rhs
+      - literal mode: lhs is a MemRefType buffer; literal is a compile-time
+        string constant.  rhs and length must be absent.
+        Emitted as: trim(lhs) .eq. 'literal'
 
-    def __init__(self, lhs, rhs, length: int):
-        super().__init__(
-            operands=[lhs, rhs],
-            properties={"length": IntegerAttr.from_int_and_width(length, 64)},
-            result_types=[i1],
-        )
-
-
-@irdl_op_definition
-class StringEqOp(IRDLOperation):
-    """Compare an assumed-length string memref against a compile-time literal.
-
-    lhs is a memref<?xi8> (Fortran character(len=*) buffer).
-    literal is the string constant to compare against.
-    Returns i1: 1 if equal (after trimming whitespace), 0 if not.
-
-    Printed as: trim(lhs) .eq. 'literal'
+    Returns i1: 1 if equal, 0 if not.
     """
 
-    name = "ccpp_utils.string_eq"
+    name = "ccpp_utils.strcmp"
 
-    lhs = operand_def(MemRefType)  # memref<?xi8>
-    literal = prop_def(StringAttr)
+    lhs = operand_def(LLVMArrayType | MemRefType)
+    rhs = opt_operand_def(LLVMArrayType | MemRefType)
+    length = opt_prop_def(IntegerAttr)
+    literal = opt_prop_def(StringAttr)
     res = result_def(i1)
 
-    def __init__(self, lhs, literal: str | StringAttr):
+    def verify_(self) -> None:
+        has_rhs = self.rhs is not None
+        has_length = self.length is not None
+        has_literal = self.literal is not None
+        if has_literal and (has_rhs or has_length):
+            raise VerifyException("StrCmpOp: literal cannot be combined with rhs or length")
+        if not has_literal and not (has_rhs and has_length):
+            raise VerifyException("StrCmpOp: must have either (rhs and length) or literal")
+
+    def __init__(self, lhs, rhs=None, length: int | None = None,
+                 literal: str | StringAttr | None = None):
         if isinstance(literal, str):
             literal = StringAttr(literal)
+        props: dict = {}
+        if length is not None:
+            props["length"] = IntegerAttr.from_int_and_width(length, 64)
+        if literal is not None:
+            props["literal"] = literal
         super().__init__(
-            operands=[lhs],
-            properties={"literal": literal},
+            operands=[lhs, rhs],
+            properties=props,
             result_types=[i1],
         )
 
@@ -210,6 +216,6 @@ class SetStringOp(IRDLOperation):
 
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, KindDefOp, SetStringOp],
+    [StrCmpOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, KindDefOp, SetStringOp],
     [RealKindType],
 )

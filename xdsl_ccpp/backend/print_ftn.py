@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, KindDefOp as CCPPKindDefOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, KindDefOp as CCPPKindDefOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -330,15 +330,12 @@ class ftnPrintContext:
                     self.print(" .neqv. ", end="", use_prefix=False)
                     self.print_expr(r.owner)
             case CCPPStrCmpOp():
-                # High-level strcmp: emit as a Fortran character equality test
                 lhs_name = self._get_variable_name_for(op.lhs)
-                rhs_name = self._get_variable_name_for(op.rhs)
-                self.print(f"{lhs_name} .eq. {rhs_name}", end="", use_prefix=False)
-            case CCPPStringEqOp():
-                # Compare an assumed-length string against a compile-time literal
-                lhs_name = self._get_variable_name_for(op.lhs)
-                literal_val = op.literal.data
-                self.print(f"trim({lhs_name}) .eq. '{literal_val}'", end="", use_prefix=False)
+                if op.literal is not None:
+                    self.print(f"trim({lhs_name}) .eq. '{op.literal.data}'", end="", use_prefix=False)
+                else:
+                    rhs_name = self._get_variable_name_for(op.rhs)
+                    self.print(f"{lhs_name} .eq. {rhs_name}", end="", use_prefix=False)
             case arith.AddiOp():
                 self.print_expr(op.lhs.owner)
                 self.print(" + ", end="", use_prefix=False)
