@@ -1,4 +1,5 @@
-from xdsl.dialects.builtin import IntegerAttr, StringAttr, i1, i64
+from xdsl.dialects.builtin import IntegerAttr, IntegerType, MemRefType, StringAttr, i1, i64
+from xdsl.dialects.llvm import LLVMArrayType
 from xdsl.ir import Dialect, ParametrizedAttribute, SSAValue, TypeAttribute
 from xdsl.irdl import (
     AttrSizedOperandSegments,
@@ -17,8 +18,8 @@ from xdsl.irdl import (
 class StrCmpOp(IRDLOperation):
     name = "ccpp_utils.strcmp"
 
-    lhs = operand_def()  # !llvm.array<N x i8>
-    rhs = operand_def()  # !llvm.array<M x i8>
+    lhs = operand_def(LLVMArrayType)  # !llvm.array<N x i8>
+    rhs = operand_def(LLVMArrayType)  # !llvm.array<M x i8>
     length = prop_def(IntegerAttr)  # number of bytes to compare
     res = result_def(i1)  # 1 if equal, 0 if not
 
@@ -43,7 +44,7 @@ class StringEqOp(IRDLOperation):
 
     name = "ccpp_utils.string_eq"
 
-    lhs = operand_def()  # memref<?xi8>
+    lhs = operand_def(MemRefType)  # memref<?xi8>
     literal = prop_def(StringAttr)
     res = result_def(i1)
 
@@ -100,8 +101,8 @@ class WriteErrMsgOp(IRDLOperation):
 
     name = "ccpp_utils.write_errmsg"
 
-    dest = operand_def()  # memref<512xi8>
-    var = operand_def()   # memref<?xi8>
+    dest = operand_def(MemRefType)                  # memref<512xi8>
+    var = operand_def(MemRefType | LLVMArrayType)   # memref<?xi8> or !llvm.array<N x i8>
     prefix = prop_def(StringAttr)
     suffix = prop_def(StringAttr)
 
@@ -130,9 +131,9 @@ class ArraySectionOp(IRDLOperation):
 
     name = "ccpp_utils.array_section"
 
-    source = operand_def()
-    lowers = var_operand_def()
-    uppers = var_operand_def()
+    source = operand_def(MemRefType)
+    lowers = var_operand_def(MemRefType | IntegerType)
+    uppers = var_operand_def(MemRefType | IntegerType)
     res = result_def()
 
     irdl_options = [AttrSizedOperandSegments()]
@@ -200,8 +201,8 @@ class SetStringOp(IRDLOperation):
 
     name = "ccpp_utils.set_string"
 
-    dest = operand_def()  # memref<?xi8>
-    src = operand_def()   # !llvm.array<N x i8>
+    dest = operand_def(MemRefType)      # memref<?xi8>
+    src = operand_def(LLVMArrayType)   # !llvm.array<N x i8>
 
     def __init__(self, dest, src):
         super().__init__(operands=[dest, src])
