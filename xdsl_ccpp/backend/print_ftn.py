@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, StringEqOp as CCPPStringEqOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -188,6 +188,8 @@ class ftnPrintContext:
           - memref<NxT>     → character(len=N) for character, T(N) otherwise
         """
         match type_attr:
+            case CCPPRealKindType() as rkt:
+                return f"real(kind={rkt.kind_name.data})"
             case Float32Type():
                 return "real(kind=4)"
             case Float64Type():

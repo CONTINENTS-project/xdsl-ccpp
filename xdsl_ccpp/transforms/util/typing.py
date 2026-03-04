@@ -1,5 +1,6 @@
 from xdsl.dialects import builtin, memref
 from xdsl.dialects.builtin import DYNAMIC_INDEX
+from xdsl_ccpp.dialects.ccpp_utils import RealKindType
 
 
 class TypeConversions():
@@ -64,8 +65,13 @@ class TypeConversions():
             - Shape ``[?, ?, ...]`` with ``dimensions`` entries if ``dimensions > 0``.
             - Shape ``[]`` (zero-dimensional scalar memref) otherwise.
         """
-        base_type = cls.getBaseType(text_type)
         shape = []
+        if text_type == "real" and kind is not None and "len=" not in kind:
+            # Named kind qualifier (e.g. kind_phys) — use RealKindType to carry
+            # the kind name through the IR for Fortran code generation.
+            base_type = RealKindType(kind)
+        else:
+            base_type = cls.getBaseType(text_type)
         if kind is not None and "len=" in kind:
             # A 'len=N' kind qualifier on a character type sets the string length.
             # Other kind values (e.g. 'kind_phys') are Fortran precision specifiers

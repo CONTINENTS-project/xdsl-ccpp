@@ -1,10 +1,12 @@
 from xdsl.dialects.builtin import IntegerAttr, StringAttr, i1, i64
-from xdsl.ir import Dialect, SSAValue
+from xdsl.ir import Dialect, ParametrizedAttribute, SSAValue, TypeAttribute
 from xdsl.irdl import (
     AttrSizedOperandSegments,
     IRDLOperation,
+    irdl_attr_definition,
     irdl_op_definition,
     operand_def,
+    param_def,
     prop_def,
     result_def,
     var_operand_def,
@@ -143,6 +145,23 @@ class ArraySectionOp(IRDLOperation):
         )
 
 
+@irdl_attr_definition
+class RealKindType(ParametrizedAttribute, TypeAttribute):
+    """MLIR type representing a Fortran real with a named kind qualifier.
+
+    Used for Fortran code generation only — carries the kind name through
+    the IR so the printer can emit 'real(kind=kind_name)' declarations.
+    """
+
+    name = "ccpp_utils.real_kind"
+    kind_name: StringAttr = param_def()
+
+    def __init__(self, kind_name: str | StringAttr):
+        if isinstance(kind_name, str):
+            kind_name = StringAttr(kind_name)
+        super().__init__(kind_name)
+
+
 @irdl_op_definition
 class SetStringOp(IRDLOperation):
     """Assign a string constant (llvm.array) into a character memref buffer.
@@ -168,5 +187,5 @@ class SetStringOp(IRDLOperation):
 CCPPUtils = Dialect(
     "ccpp_utils",
     [StrCmpOp, StringEqOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, SetStringOp],
-    [],
+    [RealKindType],
 )
