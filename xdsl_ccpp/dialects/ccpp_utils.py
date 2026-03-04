@@ -56,15 +56,6 @@ class StrCmpOp(IRDLOperation):
     literal = opt_prop_def(StringAttr)
     res = result_def(i1)
 
-    def verify_(self) -> None:
-        has_rhs = self.rhs is not None
-        has_length = self.length is not None
-        has_literal = self.literal is not None
-        if has_literal and (has_rhs or has_length):
-            raise VerifyException("StrCmpOp: literal cannot be combined with rhs or length")
-        if not has_literal and not (has_rhs and has_length):
-            raise VerifyException("StrCmpOp: must have either (rhs and length) or literal")
-
     def __init__(self, lhs, rhs=None, length: int | None = None,
                  literal: str | StringAttr | None = None):
         if isinstance(literal, str):
@@ -79,6 +70,15 @@ class StrCmpOp(IRDLOperation):
             properties=props,
             result_types=[i1],
         )
+
+    def verify_(self) -> None:
+        has_rhs = self.rhs is not None
+        has_length = self.length is not None
+        has_literal = self.literal is not None
+        if has_literal and (has_rhs or has_length):
+            raise VerifyException("StrCmpOp: literal cannot be combined with rhs or length")
+        if not has_literal and not (has_rhs and has_length):
+            raise VerifyException("StrCmpOp: must have either (rhs and length) or literal")
 
 
 @irdl_op_definition
