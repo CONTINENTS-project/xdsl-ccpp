@@ -35,6 +35,12 @@ class ccppMain:
             help="Write generated Fortran to stdout instead of .F90 files",
         )
         parser.add_argument(
+            "--host-name",
+            default=None,
+            help="Override the CamelCase host name prefix for generated subroutines "
+                 "(e.g. 'HelloWorld'); derived from the suite name when not set",
+        )
+        parser.add_argument(
             "-t",
             "--tempdir",
             default="tmp",
@@ -119,9 +125,12 @@ class ccppMain:
 
     def run_opt(self, tmp_dir, mlir_in):
         ftn_out = os.path.join(tmp_dir, "ccpp.ftn")
+        ccpp_cap_pass = "generate-ccpp-cap"
+        if self.options_db.get("host_name"):
+            ccpp_cap_pass += f"{{host_name={self.options_db['host_name']}}}"
         cmd = (
             f'python3 -m xdsl_ccpp.tools.ccpp_opt "{mlir_in}"'
-            f" -p generate-meta-cap,generate-suite-cap,generate-ccpp-cap,strip-ccpp"
+            f" -p generate-meta-cap,generate-suite-cap,{ccpp_cap_pass},strip-ccpp"
             f' -t ftn > "{ftn_out}"'
         )
         self.print_verbose_message(

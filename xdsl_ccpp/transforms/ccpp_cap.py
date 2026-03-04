@@ -33,6 +33,11 @@ class CCPPCAP(ModulePass):
 
     name = "generate-ccpp-cap"
 
+    # Optional override for the CamelCase host name prefix applied to all
+    # generated lifecycle subroutines.  When absent, the prefix is derived
+    # automatically from the suite name (e.g. hello_world_suite → HelloWorld).
+    host_name: str | None = None
+
     def find_ccpp_module(self, ops):
         """Return the named 'ccpp' ModuleOp from the given op list, or None."""
         for op in ops:
@@ -604,7 +609,7 @@ class CCPPCAP(ModulePass):
           - ``<CamelCase>_ccpp_physics_timestep_final``
           - ``<CamelCase>_ccpp_physics_run``
         """
-        camel_name = self._derive_camel_case_name(suite_name)
+        camel_name = self.host_name if self.host_name is not None else self._derive_camel_case_name(suite_name)
 
         scheme_names = [
             scheme.attributes["name"]
