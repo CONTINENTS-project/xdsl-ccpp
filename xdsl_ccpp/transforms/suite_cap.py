@@ -177,12 +177,13 @@ class GenerateSuiteSubroutine(RewritePattern):
         one = arith.ConstantOp.from_int_and_width(1, 32)
         store = memref.StoreOp.get(one, data_ops["errflg"], [])
         if fn_name is not None:
+            trim_state = ccpp_utils.TrimOp(loaded_state)
             write_err = ccpp_utils.WriteErrMsgOp(
-                data_ops["errmsg"], loaded_state,
+                data_ops["errmsg"], trim_state.res,
                 "Invalid initial CCPP state, '",
                 f"' in {fn_name}",
             )
-            true_ops = [write_err, one, store, scf.YieldOp()]
+            true_ops = [trim_state, write_err, one, store, scf.YieldOp()]
         else:
             true_ops = [one, store, scf.YieldOp()]
         if_op = scf.IfOp(mismatch.result, [], true_ops)

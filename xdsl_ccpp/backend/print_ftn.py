@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import IO, Literal, cast
 
 from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, KindDefOp as CCPPKindDefOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, KindDefOp as CCPPKindDefOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, TrimOp as CCPPTrimOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     ArrayAttr,
@@ -329,11 +329,15 @@ class ftnPrintContext:
                     self.print_expr(l.owner)
                     self.print(" .neqv. ", end="", use_prefix=False)
                     self.print_expr(r.owner)
-            case CCPPStrCmpOp():
+            case CCPPTrimOp():
                 lhs_name = self._get_variable_name_for(op.lhs)
+                self.print(f"trim({lhs_name})", end="", use_prefix=False)
+            case CCPPStrCmpOp():
                 if op.literal is not None:
-                    self.print(f"trim({lhs_name}) .eq. '{op.literal.data}'", end="", use_prefix=False)
+                    self.print_expr(op.lhs.owner)
+                    self.print(f" .eq. '{op.literal.data}'", end="", use_prefix=False)
                 else:
+                    lhs_name = self._get_variable_name_for(op.lhs)
                     rhs_name = self._get_variable_name_for(op.rhs)
                     self.print(f"{lhs_name} .eq. {rhs_name}", end="", use_prefix=False)
             case arith.AddiOp():
@@ -392,6 +396,8 @@ class ftnPrintContext:
                 pass  # Heap allocations are emitted via the StoreOp that uses the result
             case CCPPKindDefOp():
                 pass  # Kind definitions are declared in _print_module preamble
+            case CCPPTrimOp():
+                pass  # Used only as a sub-expression; printed inline by print_expr
             case CCPPSetStringOp():
                 # Register the source global name as the variable name for dest
                 # so that the memref.StoreOp into the allocatable can find it.
@@ -422,10 +428,9 @@ class ftnPrintContext:
                 self.variables[op.res] = op.var_name.data
             case CCPPWriteErrMsgOp():
                 dest_name = self._get_variable_name_for(op.dest)
-                var_name = self._get_variable_name_for(op.var)
-                prefix_val = op.prefix.data
-                suffix_val = op.suffix.data
-                self.print(f"write({dest_name}, '(3a)') \"{prefix_val}\", trim({var_name}), \"{suffix_val}\"")
+                self.print(f"write({dest_name}, '(3a)') \"{op.prefix.data}\", ", end="")
+                self.print_expr(op.var.owner)
+                self.print(f", \"{op.suffix.data}\"", use_prefix=False)
             case CCPPArraySectionOp():
                 # Register the full Fortran array-section expression as the
                 # result's variable name so call-site printing emits it inline.

@@ -8,7 +8,7 @@ from xdsl.ir import Block, Region
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects import ccpp_utils
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StrCmpOp, HostVarRefOp, WriteErrMsgOp, SetStringOp
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StrCmpOp, TrimOp, HostVarRefOp, WriteErrMsgOp, SetStringOp
 
 from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPType
 from xdsl_ccpp.transforms.util.typing import TypeConversions
@@ -157,7 +157,8 @@ class CCPPCAP(ModulePass):
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
         store_errflg = memref.StoreOp.get(err_const, errflg_alloc, [])
 
-        string_eq_op = StrCmpOp(new_block.args[0], literal=suite_name)
+        trim_suite_name = TrimOp(new_block.args[0])
+        string_eq_op = StrCmpOp(trim_suite_name.res, literal=suite_name)
 
         call_op = func.CallOp(suite_callee, [], call_ret_types)
 
@@ -168,7 +169,7 @@ class CCPPCAP(ModulePass):
             elif ret_type == errflg_type:
                 copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_alloc))
 
-        write_err = WriteErrMsgOp(errmsg_alloc, new_block.args[0], "No suite named ", "found")
+        write_err = WriteErrMsgOp(errmsg_alloc, trim_suite_name.res, "No suite named ", "found")
         one_err = arith.ConstantOp.from_int_and_width(1, 32)
         store_errflg_err = memref.StoreOp.get(one_err, errflg_alloc, [])
 
@@ -183,6 +184,7 @@ class CCPPCAP(ModulePass):
         new_block.add_ops([
             errmsg_alloc, errflg_alloc,
             err_const, store_errflg,
+            trim_suite_name,
             string_eq_op,
             if_op,
             ret_op,
@@ -447,8 +449,10 @@ class CCPPCAP(ModulePass):
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
         store_errflg = memref.StoreOp.get(err_const, errflg_arg, [])
 
-        suite_name_eq = StrCmpOp(suite_name_arg, literal=suite_name)
-        suite_part_eq = StrCmpOp(suite_part_arg, literal=suite_part)
+        trim_suite_name = TrimOp(suite_name_arg)
+        suite_name_eq = StrCmpOp(trim_suite_name.res, literal=suite_name)
+        trim_suite_part = TrimOp(suite_part_arg)
+        suite_part_eq = StrCmpOp(trim_suite_part.res, literal=suite_part)
 
         call_op = func.CallOp(suite_callee, call_args, callee_output_types)
 
@@ -460,7 +464,7 @@ class CCPPCAP(ModulePass):
                 copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_arg))
 
         write_suite_part = WriteErrMsgOp(
-            errmsg_arg, suite_part_arg,
+            errmsg_arg, trim_suite_part.res,
             "No suite part named ",
             f" found in suite {suite_name}",
         )
@@ -474,7 +478,7 @@ class CCPPCAP(ModulePass):
         )
 
         write_suite_name = WriteErrMsgOp(
-            errmsg_arg, suite_name_arg,
+            errmsg_arg, trim_suite_name.res,
             "No suite named ",
             "found",
         )
@@ -483,7 +487,7 @@ class CCPPCAP(ModulePass):
 
         outer_if = scf.IfOp(
             suite_name_eq.res, [],
-            [suite_part_eq, inner_if, scf.YieldOp()],
+            [trim_suite_part, suite_part_eq, inner_if, scf.YieldOp()],
             [write_suite_name, one_outer, store_errflg_outer, scf.YieldOp()],
         )
 
@@ -493,6 +497,7 @@ class CCPPCAP(ModulePass):
             err_const, store_errflg,
             *host_var_ref_ops,
             *array_section_ops,
+            trim_suite_name,
             suite_name_eq,
             outer_if,
             ret_op,
@@ -548,7 +553,8 @@ class CCPPCAP(ModulePass):
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
         store_errflg = memref.StoreOp.get(err_const, errflg_alloc, [])
 
-        string_eq_op = StrCmpOp(new_block.args[0], literal=suite_name)
+        trim_suite_name = TrimOp(new_block.args[0])
+        string_eq_op = StrCmpOp(trim_suite_name.res, literal=suite_name)
 
         # True branch: for each part name, alloc a string buffer, load the
         # global constant via AddressOf + Load, assign via SetStringOp, then
@@ -566,7 +572,7 @@ class CCPPCAP(ModulePass):
         true_ops.append(scf.YieldOp())
 
         # False branch: error
-        write_err = WriteErrMsgOp(errmsg_alloc, new_block.args[0], "No suite named ", " found")
+        write_err = WriteErrMsgOp(errmsg_alloc, trim_suite_name.res, "No suite named ", " found")
         one_err = arith.ConstantOp.from_int_and_width(1, 32)
         store_errflg_err = memref.StoreOp.get(one_err, errflg_alloc, [])
 
@@ -581,6 +587,7 @@ class CCPPCAP(ModulePass):
         new_block.add_ops([
             errmsg_alloc, errflg_alloc,
             err_const, store_errflg,
+            trim_suite_name,
             string_eq_op,
             if_op,
             ret_op,

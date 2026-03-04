@@ -214,8 +214,30 @@ class SetStringOp(IRDLOperation):
         super().__init__(operands=[dest, src])
 
 
+@irdl_op_definition
+class TrimOp(IRDLOperation):
+    """Apply Fortran trim() to an assumed-length string memref.
+
+    Used purely for Fortran code generation — the result carries the trimmed
+    string expression through the IR so the printer emits 'trim(var_name)'
+    wherever the result is used as a sub-expression.
+    """
+
+    name = "ccpp_utils.trim"
+
+    lhs = operand_def(LLVMArrayType | MemRefType)
+    res = result_def()
+
+    def __init__(self, lhs):
+        lhs_val = SSAValue.get(lhs)
+        super().__init__(
+            operands=[lhs],
+            result_types=[lhs_val.type],
+        )
+
+
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, KindDefOp, SetStringOp],
+    [StrCmpOp, TrimOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, KindDefOp, SetStringOp],
     [RealKindType],
 )
