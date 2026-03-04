@@ -468,14 +468,17 @@ class ftnPrintContext:
         if not is_kinds_module:
             self.print("\nuse ccpp_kinds", prefix="  ")
 
-        # Emit 'use iso_fortran_env, only: ...' for any ISO kind values present
-        iso_uses = sorted(
-            op.kind_value.data
-            for op in body.ops
-            if isa(op, CCPPKindDefOp) and op.kind_value.data in self._ISO_FORTRAN_ENV_KINDS
-        )
-        if iso_uses:
-            self.print(f"use iso_fortran_env, only: {', '.join(iso_uses)}", prefix="  ")
+        # For the ccpp_kinds module, emit ISO_FORTRAN_ENV renames:
+        #   use ISO_FORTRAN_ENV, only: kind_phys => REAL64
+        # This imports and re-exports each kind under its CCPP name in one step.
+        if is_kinds_module:
+            iso_renames = ", ".join(
+                f"{op.kind_name.data} => {op.kind_value.data}"
+                for op in body.ops
+                if isa(op, CCPPKindDefOp) and op.kind_value.data in self._ISO_FORTRAN_ENV_KINDS
+            )
+            if iso_renames:
+                self.print(f"use ISO_FORTRAN_ENV, only: {iso_renames}", prefix="  ")
 
         # Emit 'use <module>, only: <name>' lines.  Two sources:
         #   1. External FuncOps with a 'module' attribute (suite cap callees).
@@ -500,13 +503,11 @@ class ftnPrintContext:
         self.print("private", prefix="  ")
         self.print("")
 
-        # Emit kind parameter declarations (ccpp_kinds module)
+        # Emit 'public :: kind_name' for each kind (the rename in the use statement
+        # above already brings the name into scope; only visibility needs declaring).
         for op in body.ops:
             if isa(op, CCPPKindDefOp):
-                self.print(
-                    f"integer, parameter, public :: {op.kind_name.data} = {op.kind_value.data}",
-                    prefix="  ",
-                )
+                self.print(f"public :: {op.kind_name.data}", prefix="  ")
 
         # Emit module-level character variable declarations for each LLVM global.
         # Globals with a 'module' attribute are USE-associated (already emitted
