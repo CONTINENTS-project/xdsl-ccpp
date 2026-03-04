@@ -14,6 +14,23 @@ from xdsl.irdl import (
 )
 
 
+@irdl_attr_definition
+class RealKindType(ParametrizedAttribute, TypeAttribute):
+    """MLIR type representing a Fortran real with a named kind qualifier.
+
+    Used for Fortran code generation only — carries the kind name through
+    the IR so the printer can emit 'real(kind=kind_name)' declarations.
+    """
+
+    name = "ccpp_utils.real_kind"
+    kind_name: StringAttr = param_def()
+
+    def __init__(self, kind_name: str | StringAttr):
+        if isinstance(kind_name, str):
+            kind_name = StringAttr(kind_name)
+        super().__init__(kind_name)
+
+
 @irdl_op_definition
 class StrCmpOp(IRDLOperation):
     name = "ccpp_utils.strcmp"
@@ -134,7 +151,7 @@ class ArraySectionOp(IRDLOperation):
     source = operand_def(MemRefType)
     lowers = var_operand_def(MemRefType | IntegerType)
     uppers = var_operand_def(MemRefType | IntegerType)
-    res = result_def()
+    res = result_def(MemRefType)
 
     irdl_options = [AttrSizedOperandSegments()]
 
@@ -144,23 +161,6 @@ class ArraySectionOp(IRDLOperation):
             operands=[source, list(lowers), list(uppers)],
             result_types=[source_val.type],
         )
-
-
-@irdl_attr_definition
-class RealKindType(ParametrizedAttribute, TypeAttribute):
-    """MLIR type representing a Fortran real with a named kind qualifier.
-
-    Used for Fortran code generation only — carries the kind name through
-    the IR so the printer can emit 'real(kind=kind_name)' declarations.
-    """
-
-    name = "ccpp_utils.real_kind"
-    kind_name: StringAttr = param_def()
-
-    def __init__(self, kind_name: str | StringAttr):
-        if isinstance(kind_name, str):
-            kind_name = StringAttr(kind_name)
-        super().__init__(kind_name)
 
 
 @irdl_op_definition
