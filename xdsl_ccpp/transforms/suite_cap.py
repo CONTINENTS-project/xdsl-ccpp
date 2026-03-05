@@ -64,9 +64,14 @@ class GenerateSuiteSubroutine(RewritePattern):
         return scheme_names
 
     def getArgumentTable(self, scheme_name, subroutine_name):
-        """Look up the argument table for a specific scheme subroutine."""
+        """Look up the argument table for a specific scheme subroutine.
+
+        Returns None if the scheme has no entry for subroutine_name (optional
+        entry points such as _finalize may be absent).
+        """
         assert scheme_name in self.meta_data
-        return self.meta_data[scheme_name].getArgTable(subroutine_name)
+        arg_tables = self.meta_data[scheme_name].arg_tables
+        return arg_tables.get(subroutine_name)
 
     def generateVariableCreation(self, scheme_names, arg_tables):
         """Allocate a memref for every unique argument across all schemes.
@@ -246,14 +251,17 @@ class GenerateSuiteSubroutine(RewritePattern):
         arg_tables = {}
         all_args = {}
         if tgt_subroutine_postfix is not None:
-            # Fetch the argument table for each scheme's target subroutine
+            # Fetch the argument table for each scheme's target subroutine;
+            # schemes that don't have this entry point (e.g. no _finalize) are skipped.
             for scheme_name in scheme_names:
-                arg_tables[scheme_name] = self.getArgumentTable(
+                table = self.getArgumentTable(
                     scheme_name, scheme_name + tgt_subroutine_postfix
                 )
+                if table is not None:
+                    arg_tables[scheme_name] = table
 
             # Collect unique args across all schemes, preserving first-seen order
-            for scheme_name in scheme_names:
+            for scheme_name in arg_tables:
                 for fn_arg in arg_tables[scheme_name].getFunctionArguments():
                     if fn_arg.name in all_args:
                         assert fn_arg.getAttr("type") == all_args[fn_arg.name].getAttr(
@@ -399,10 +407,10 @@ class GenerateSuiteSubroutine(RewritePattern):
         call_ops = []
         fn_sigs = {}
         if tgt_subroutine_postfix is not None:
-            # Emit a guarded call for each scheme in suite order
-            for scheme_name in scheme_names:
-                assert scheme_name + tgt_subroutine_postfix in self.meta_fn_sigs
+            # Emit a guarded call for each scheme that has this entry point (in suite order)
+            for scheme_name in arg_tables:
                 full_name = scheme_name + tgt_subroutine_postfix
+                assert full_name in self.meta_fn_sigs
                 call_ops += self.generateSchemeSubroutineCallOps(
                     full_name, arg_tables[scheme_name], data_ops
                 )

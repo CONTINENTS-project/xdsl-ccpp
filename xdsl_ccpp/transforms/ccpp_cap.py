@@ -117,9 +117,8 @@ class CCPPCAP(ModulePass):
         all_out_args = {}
         for scheme_name in scheme_names:
             table_name = scheme_name + table_postfix
-            assert table_name in meta_data[scheme_name].arg_tables, (
-                f"No '{table_postfix}' arg table found for scheme '{scheme_name}'"
-            )
+            if table_name not in meta_data[scheme_name].arg_tables:
+                continue
             arg_table = meta_data[scheme_name].getArgTable(table_name)
             for fn_arg in arg_table.getFunctionArguments():
                 if (

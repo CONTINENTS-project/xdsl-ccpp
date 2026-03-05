@@ -15,6 +15,7 @@ from xdsl.pattern_rewriter import (
 from xdsl_ccpp.dialects import ccpp
 from xdsl_ccpp.transforms.util.ccpp_descriptors import (
     BuildMetaDataDescriptions,
+    CCPPType,
 )
 from xdsl_ccpp.transforms.util.typing import TypeConversions
 
@@ -152,9 +153,11 @@ class MetaCAP(ModulePass):
         bmdd.traverse(mod)
         meta_data_descriptions = bmdd.meta_data
 
-        # Generate one external func declaration per argument table (scheme entry point)
+        # Generate one external func declaration per argument table (scheme entry points only)
         ops = []
         for prop in meta_data_descriptions.values():
+            if prop.getAttr("type") != CCPPType.SCHEME:
+                continue
             for table in prop.arg_tables.values():
                 ops.append(self.generate_function_signature(table))
 

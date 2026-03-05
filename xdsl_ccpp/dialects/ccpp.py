@@ -139,6 +139,9 @@ class TableBaseOp(IRDLOperation):
         if isa(table_type, str):
             table_type = TableTypeKindAttr(TableTypeKind(table_type))
 
+        if not isinstance(body, Region):
+            body = Region([Block(body)])
+
         super().__init__(
             regions=[body], properties={"name": table_name, "type": table_type}
         )
@@ -261,7 +264,7 @@ class ArgumentOp(IRDLOperation):
                 properties["optional"] = UnitAttr()
                 prop_keys.remove("optional")
 
-        assert len(prop_keys) == 0
+        # Silently ignore unrecognised keys (e.g. state_variable, allocatable)
 
         super().__init__(properties=properties)
 
