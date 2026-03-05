@@ -294,7 +294,7 @@ class BuildMetaDataDescriptions(Visitor):
 
         # 'optional' is a flag attribute — store as a boolean rather than a string
         if "optional" in arg_op.properties:
-            arg["optional"] = True
+            arg.setAttr("optional", True)
 
         # Surface the completed argument to the parent traversal via self.arg_token
         self.arg_token = arg

@@ -118,35 +118,89 @@ class GenerateSuiteSubroutine(RewritePattern):
         Constructs the call op, copies out-arg results back to their storage
         locations, then wraps everything in an scf.if that only executes when
         errflg is zero (i.e. no prior error has occurred).
+
+        When the suite cap's local variable type does not match the callee's
+        declared parameter type (e.g. the suite holds a 2-D array but the
+        scheme expects 1-D), an UnrealizedConversionCastOp is inserted as a
+        type annotation so xDSL verification passes.  The Fortran printer looks
+        through these casts and emits the underlying variable name.
         """
+        # Retrieve the callee's declared input/output types to detect mismatches.
+        callee = self.meta_fn_sigs.get(subroutine_name)
+        callee_in_types = list(callee.function_type.inputs) if callee else []
+        callee_out_types = list(callee.function_type.outputs) if callee else []
+
         in_ssa = []
         out_types = []
         out_tracking = []
+        cast_ops = []  # casts inserted before the call inside the if-body
+        in_idx = 0
+        out_idx = 0
+
         # Classify each argument as an input, output, or both (inout)
         for arg in arg_table.getFunctionArguments():
             intent = arg.getAttr("intent")
             if intent == "in" or intent == "inout":
-                in_ssa.append(data_ops[arg.name])
-            if intent == "out" or intent == "inout":
                 val = data_ops[arg.name]
-                out_types.append(
+                actual_type = (
                     val.type if isinstance(val, SSAValue) else val.results[0].type
                 )
+                expected_type = (
+                    callee_in_types[in_idx]
+                    if in_idx < len(callee_in_types)
+                    else actual_type
+                )
+                if actual_type != expected_type:
+                    cast = builtin.UnrealizedConversionCastOp(
+                        operands=[[val]], result_types=[[expected_type]]
+                    )
+                    cast_ops.append(cast)
+                    in_ssa.append(cast.results[0])
+                else:
+                    in_ssa.append(val)
+                in_idx += 1
+            if intent == "out" or intent == "inout":
+                val = data_ops[arg.name]
+                expected_out_type = (
+                    callee_out_types[out_idx]
+                    if out_idx < len(callee_out_types)
+                    else (
+                        val.type if isinstance(val, SSAValue) else val.results[0].type
+                    )
+                )
+                out_types.append(expected_out_type)
                 out_tracking.append(val)
+                out_idx += 1
 
         assert len(out_types) == len(out_tracking)
         call_op = func.CallOp(subroutine_name, in_ssa, out_types)
 
-        # Copy each output result back to its storage location
+        # Copy each output result back to its storage location.
+        # If the result type doesn't match the destination, cast back first.
         store_ops = []
         for idx, out_var in enumerate(out_tracking):
-            store_ops.append(memref.CopyOp(call_op.results[idx], out_var))
+            dest_type = (
+                out_var.type
+                if isinstance(out_var, SSAValue)
+                else out_var.results[0].type
+            )
+            result = call_op.results[idx]
+            if result.type != dest_type:
+                back_cast = builtin.UnrealizedConversionCastOp(
+                    operands=[[result]], result_types=[[dest_type]]
+                )
+                store_ops.append(back_cast)
+                store_ops.append(memref.CopyOp(back_cast.results[0], out_var))
+            else:
+                store_ops.append(memref.CopyOp(result, out_var))
 
         # Guard the call: only execute when errflg == 0
         err_const_comp = arith.ConstantOp.from_int_and_width(0, 32)
         load_op = memref.LoadOp.get(data_ops["errflg"], [])
         cmp = arith.CmpiOp(load_op, err_const_comp, 0)
-        conditional_op = scf.IfOp(cmp, [], [call_op] + store_ops + [scf.YieldOp()])
+        conditional_op = scf.IfOp(
+            cmp, [], cast_ops + [call_op] + store_ops + [scf.YieldOp()]
+        )
 
         return [err_const_comp, cmp, load_op, conditional_op]
 
@@ -350,11 +404,10 @@ class GenerateSuiteSubroutine(RewritePattern):
         # Allocate local storage for each output-only argument
         for fn_arg in output_arg_list:
             arg_type = fn_arg.getAttr("type")
-            data_shape = []
-            if arg_type == "character":
-                data_shape.append(int(fn_arg.getAttr("kind").split("=")[1]))
+            kind = fn_arg.getAttr("kind") if fn_arg.hasAttr("kind") else None
+            full_type = TypeConversions.convert(arg_type, kind, 0)
             alloc_op = memref.AllocaOp.get(
-                TypeConversions.getBaseType(arg_type), shape=data_shape
+                full_type.element_type, shape=list(full_type.shape.data)
             )
             alloc_op.memref.name_hint = fn_arg.name
             alloc_ops[fn_arg.name] = alloc_op

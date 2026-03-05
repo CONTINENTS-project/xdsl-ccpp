@@ -47,6 +47,12 @@ class ccppMain:
             help="Temporary directory for intermediate files (default: 'tmp')",
         )
         parser.add_argument(
+            "-d",
+            "--debug",
+            action="store_true",
+            help="Keep temporary files after compilation (do not clean up)",
+        )
+        parser.add_argument(
             "-v",
             "--verbose",
             type=int,
@@ -190,9 +196,10 @@ class ccppMain:
         ftn_file = self.run_opt(tmp_dir, mlir_file)
         self.split_fortran_output(ftn_file, out_dir)
 
-        self.remove_file_if_exists(mlir_file, ftn_file)
-        if os.path.isdir(tmp_dir) and not os.listdir(tmp_dir):
-            os.rmdir(tmp_dir)
+        if not self.options_db.get("debug"):
+            self.remove_file_if_exists(mlir_file, ftn_file)
+            if os.path.isdir(tmp_dir) and not os.listdir(tmp_dir):
+                os.rmdir(tmp_dir)
 
 
 def main():

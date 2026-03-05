@@ -120,7 +120,9 @@ class CCPPArgumentTable(CCPPItem):
         self.function_arguments = {}
 
     def setAttr(self, key, value):
-        super().setAttr(key, value, ["name", "type"])
+        # Silently ignore unrecognised keys (e.g. process)
+        if key in ("name", "type"):
+            super().setAttr(key, value, ["name", "type"])
 
     def setFunctionArgument(self, fn_arg):
         """Add an argument to this table, keyed by its name."""
@@ -351,8 +353,8 @@ class ccppXML:
             for line in file:
                 sline = line.strip()
 
-                # Ignore blank lines
-                if not sline:
+                # Ignore blank lines and comment lines
+                if not sline or sline.startswith("#"):
                     continue
 
                 if "[" in sline and "]" in sline:
@@ -483,10 +485,8 @@ class ccppXML:
         args = parser.parse_args()
         self.options_db = self.build_options_db_from_args(args)
 
-        # Only one suite is supported per invocation
-        assert len(self.options_db["suites"]) == 1
-        suites = XMLSuite(self.options_db["suites"][0])
-        ir_ops.append(self.build_suite_ir(suites))
+        for suite_file in self.options_db["suites"]:
+            ir_ops.append(self.build_suite_ir(XMLSuite(suite_file)))
 
         # Parse each scheme metadata file and emit a TablePropertiesOp
         schemes = {}

@@ -69,6 +69,11 @@ class ftnPrintContext:
         default_factory=dict[str, dict[str, str | None]]
     )
 
+    # Tracks how many times each allocatable char array has been stored to.
+    # Key: id of the SSA value; value: 1-based index of the next store.
+    # Used to emit allocate(arr(N)) once and suites(i) = ... with correct indices.
+    _allocatable_store_indices: dict = field(default_factory=dict)
+
     def register_binops(self):
         """Populate the binary-operator and comparison-operator lookup tables.
 
@@ -417,14 +422,26 @@ class ftnPrintContext:
                     val.owner, memref.AllocOp
                 ):
                     # Storing a memref<?xi8> (string buffer) into memref<memref<?xi8>>
-                    # (the allocatable out arg).  Emit allocate(suites(1)) and then
-                    # assign from the name that SetStringOp registered for val
-                    # (e.g. suites(1) = str_hello_world_suite).
+                    # (the allocatable out arg).  On the first store emit
+                    # allocate(arr(N)) where N is the total number of such stores in
+                    # this block; then emit arr(i) = string_src for each store.
                     arr_name = self._get_variable_name_for(arr)
                     string_src = self.variables.get(val)
-                    self.print(f"allocate({arr_name}(1))")
+                    key = id(arr)
+                    if key not in self._allocatable_store_indices:
+                        total = sum(
+                            1
+                            for sibling in op.parent.ops
+                            if isa(sibling, memref.StoreOp)
+                            and sibling.memref is arr
+                            and isa(sibling.value.owner, memref.AllocOp)
+                        )
+                        self._allocatable_store_indices[key] = (1, total)
+                        self.print(f"allocate({arr_name}({total}))")
+                    idx, total = self._allocatable_store_indices[key]
+                    self._allocatable_store_indices[key] = (idx + 1, total)
                     if string_src is not None:
-                        self.print(f"{arr_name}(1) = {string_src}")
+                        self.print(f"{arr_name}({idx}) = {string_src}")
                 else:
                     arr_name = self._get_variable_name_for(arr)
                     idx_args = ", ".join(map(self._get_variable_name_for, idxs))
@@ -452,6 +469,11 @@ class ftnPrintContext:
                     upper_str = self._value_to_expr_str(upper)
                     parts.append(f"{lower_str}:{upper_str}")
                 self.variables[op.res] = f"{source_name}({', '.join(parts)})"
+            case builtin.UnrealizedConversionCastOp():
+                # Type annotation cast — transparent to Fortran; map each result
+                # to the same variable name as the corresponding input operand.
+                for result, operand in zip(op.results, op.inputs):
+                    self.variables[result] = self._get_variable_name_for(operand)
 
     # ISO_FORTRAN_ENV named constants recognised as kind values
     _ISO_FORTRAN_ENV_KINDS: frozenset[str] = frozenset(
@@ -686,12 +708,25 @@ class ftnPrintContext:
 
         # Collect call results that have no CopyOp consumer — they become anonymous locals
         # (e.g. DDT outputs from init that the ccpp_cap doesn't route anywhere).
+        # Also look one level through UnrealizedConversionCastOp (inserted for type mismatches).
+        def _has_copy_consumer(ssa):
+            for u in ssa.uses:
+                if isa(u.operation, memref.CopyOp):
+                    return True
+                if isa(u.operation, builtin.UnrealizedConversionCastOp):
+                    if any(
+                        isa(u2.operation, memref.CopyOp)
+                        for u2 in u.operation.results[0].uses
+                    ):
+                        return True
+            return False
+
         untracked_call_results: list[tuple[OpResult, str]] = []
         for nested_op in bdy.block.walk():
             if not isa(nested_op, func.CallOp):
                 continue
             for res in nested_op.results:
-                has_copy = any(isa(u.operation, memref.CopyOp) for u in res.uses)
+                has_copy = _has_copy_consumer(res)
                 if not has_copy:
                     hint = (
                         res.name_hint
