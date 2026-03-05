@@ -305,7 +305,7 @@ class ccppXML:
         return options_db
 
     def parse_metadata_file(self, filename, isScheme):
-        """Parse a ``.meta`` file and return a `MetaData` object.
+        """Parse a ``.meta`` file and return a list of `MetaData` objects.
 
         ``.meta`` files use a Fortran-style ini format with three kinds of
         section headers:
@@ -319,19 +319,33 @@ class ccppXML:
         may appear on one line separated by ``|``
         (e.g. ``type = real | kind = kind_phys``).  Blank lines are ignored.
 
+        A single file may contain multiple ``[ccpp-table-properties]`` blocks
+        (e.g. a DDT definition followed by the scheme that uses it).  Each block
+        produces a separate `MetaData` entry in the returned list.
+
         Args:
             filename: Path to the ``.meta`` file.
-            isScheme: If True, return `SchemeMetaData`; otherwise `HostMetaData`.
+            isScheme: If True, return `SchemeMetaData` instances; otherwise `HostMetaData`.
 
         Returns:
-            A `SchemeMetaData` or `HostMetaData` containing the parsed table
-            properties and all argument tables found in the file.
+            A list of `SchemeMetaData` or `HostMetaData` objects, one per
+            ``[ccpp-table-properties]`` block found in the file.
         """
+        completed = []
         current_table_properties = None
         current_arg_table = None
         parse_state = ccppXML.MetaParseState.NONE
         table_arg_tables = []
         current_arg = None
+
+        def _flush_table_properties():
+            nonlocal current_table_properties, table_arg_tables
+            if current_table_properties is None:
+                return
+            cls = SchemeMetaData if isScheme else HostMetaData
+            completed.append(cls(current_table_properties, table_arg_tables))
+            current_table_properties = None
+            table_arg_tables = []
 
         with open(filename) as file:
             for line in file:
@@ -355,8 +369,8 @@ class ccppXML:
                             current_arg_table = None
 
                     if token == "ccpp-table-properties":
-                        # Begin a new table-properties block (only one per file)
-                        assert current_table_properties is None
+                        # Flush the previous block (if any) before starting a new one
+                        _flush_table_properties()
                         current_table_properties = CCPPTableProperties()
                         parse_state = ccppXML.MetaParseState.PROPERTIES
                     elif token == "ccpp-arg-table":
@@ -401,12 +415,10 @@ class ccppXML:
             current_arg_table.setFunctionArgument(current_arg)
         if current_arg_table is not None:
             table_arg_tables.append(current_arg_table)
+        _flush_table_properties()
 
-        assert current_table_properties is not None
-        if isScheme:
-            return SchemeMetaData(current_table_properties, table_arg_tables)
-        else:
-            return HostMetaData(current_table_properties, table_arg_tables)
+        assert completed
+        return completed
 
     def build_suite_ir(self, suite):
         """Convert a parsed `XMLSuite` tree into CCPP dialect IR ops.
@@ -479,16 +491,16 @@ class ccppXML:
         # Parse each scheme metadata file and emit a TablePropertiesOp
         schemes = {}
         for scheme_file in self.options_db["scheme_files"]:
-            c = self.parse_metadata_file(scheme_file, True)
-            schemes[c.table_properties.getAttr("name")] = c
-            ir_ops.append(self.build_meta_ir(c))
+            for c in self.parse_metadata_file(scheme_file, True):
+                schemes[c.table_properties.getAttr("name")] = c
+                ir_ops.append(self.build_meta_ir(c))
 
         # Parse each host metadata file and emit a TablePropertiesOp
         hosts = {}
         for host_file in self.options_db["host_files"]:
-            c = self.parse_metadata_file(host_file, False)
-            hosts[c.table_properties.getAttr("name")] = c
-            ir_ops.append(self.build_meta_ir(c))
+            for c in self.parse_metadata_file(host_file, False):
+                hosts[c.table_properties.getAttr("name")] = c
+                ir_ops.append(self.build_meta_ir(c))
 
         print(ModuleOp(ir_ops))
 
