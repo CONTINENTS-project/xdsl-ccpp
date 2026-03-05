@@ -1,42 +1,35 @@
 from __future__ import annotations
 
-import warnings
-from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import IO, Literal, cast
+from typing import IO, cast
 
-from xdsl.dialects import arith, csl, memref, scf, builtin, func, llvm
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp, KindDefOp as CCPPKindDefOp, RealKindType as CCPPRealKindType, StrCmpOp as CCPPStrCmpOp, TrimOp as CCPPTrimOp, HostVarRefOp as CCPPHostVarRefOp, WriteErrMsgOp as CCPPWriteErrMsgOp, SetStringOp as CCPPSetStringOp
+from xdsl.dialects import arith, builtin, func, llvm, memref, scf
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
-    ArrayAttr,
     DenseIntOrFPElementsAttr,
-    DictionaryAttr,
-    Float64Type,
     Float32Type,
+    Float64Type,
     FloatAttr,
     FunctionType,
-    IndexType,
     IntAttr,
     IntegerAttr,
     IntegerType,
     MemRefType,
     ModuleOp,
-    Signedness,
-    SignednessAttr,
     StringAttr,
-    TypeAttribute,
-    UnitAttr,
-    i1,
 )
 from xdsl.ir import Attribute, Block, Operation, OpResult, Region, SSAValue
-from xdsl.ir.affine import AffineMap
-from xdsl.irdl import Operand
-from xdsl.traits import is_side_effect_free
-from xdsl.utils.comparisons import to_unsigned
 from xdsl.utils.hints import isa
 
+from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp
+from xdsl_ccpp.dialects.ccpp_utils import HostVarRefOp as CCPPHostVarRefOp
+from xdsl_ccpp.dialects.ccpp_utils import KindDefOp as CCPPKindDefOp
+from xdsl_ccpp.dialects.ccpp_utils import RealKindType as CCPPRealKindType
+from xdsl_ccpp.dialects.ccpp_utils import SetStringOp as CCPPSetStringOp
+from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp
+from xdsl_ccpp.dialects.ccpp_utils import TrimOp as CCPPTrimOp
+from xdsl_ccpp.dialects.ccpp_utils import WriteErrMsgOp as CCPPWriteErrMsgOp
 
 _MAX_LINE_LEN = 99
 
@@ -171,7 +164,9 @@ class ftnPrintContext:
     def _is_allocatable_char(type_attr: Attribute) -> bool:
         """Return True if type_attr is memref<memref<?xi8>> (allocatable character array)."""
         match type_attr:
-            case MemRefType(element_type=MemRefType(element_type=IntegerType(width=IntAttr(data=8)))):
+            case MemRefType(
+                element_type=MemRefType(element_type=IntegerType(width=IntAttr(data=8)))
+            ):
                 return True
             case _:
                 return False
@@ -200,8 +195,10 @@ class ftnPrintContext:
                 return "character"
             case IntegerType():
                 assert cast(IntegerType, type_attr).width.data == 32
-                return f"integer"
-            case MemRefType(element_type=IntegerType(width=IntAttr(data=8)), shape=shape) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:
+                return "integer"
+            case MemRefType(
+                element_type=IntegerType(width=IntAttr(data=8)), shape=shape
+            ) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:  # noqa: E501
                 # A 1-D dynamic i8 memref is an assumed-length Fortran character
                 # argument — declared as character(len=*), not character(:).
                 return "character(len=*)"
@@ -235,10 +232,14 @@ class ftnPrintContext:
         if self._is_allocatable_char(type_attr):
             return "(:)"
         match type_attr:
-            case MemRefType(element_type=IntegerType(width=IntAttr(data=8)), shape=shape) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:
+            case MemRefType(
+                element_type=IntegerType(width=IntAttr(data=8)), shape=shape
+            ) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:  # noqa: E501
                 # character(len=*) uses len= notation — no dimension suffix needed
                 return ""
-            case MemRefType(shape=shape) if any(dim.data == DYNAMIC_INDEX for dim in shape):
+            case MemRefType(shape=shape) if any(
+                dim.data == DYNAMIC_INDEX for dim in shape
+            ):
                 # One ':' per dynamic dimension
                 return "(" + ", ".join(":" for _ in shape) + ")"
             case _:
@@ -304,14 +305,16 @@ class ftnPrintContext:
             case arith.ConstantOp(value=v, result=r):
                 # Emit the literal value of the constant
                 self._print_or_promote_to_inline_expr(r, self.attribute_value_to_str(v))
-            case memref.LoadOp(memref=arr, indices=idxs, res=res):
+            case memref.LoadOp(memref=arr):
                 # A load from a memref is represented by the variable name itself
                 self.print(self._get_variable_name_for(arr), end="", use_prefix=False)
             case arith.CmpiOp(predicate=v, lhs=l, rhs=r):
                 # Emit lhs <op> rhs using the Fortran comparison operator
                 str_pred = arith.CMPI_COMPARISON_OPERATIONS[v.value.data]
                 self.print_expr(l.owner)
-                self.print(f" {self._cmp_ops[op.name][str_pred]} ", end="", use_prefix=False)
+                self.print(
+                    f" {self._cmp_ops[op.name][str_pred]} ", end="", use_prefix=False
+                )
                 self.print_expr(r.owner)
             case arith.XOrIOp():
                 # XOrI(x, 1_i1) is a logical NOT; detect which operand is the constant
@@ -349,8 +352,7 @@ class ftnPrintContext:
                 self.print(" - ", end="", use_prefix=False)
                 self.print_expr(op.rhs.owner)
             case _:
-                print(type(op))
-                assert False
+                raise AssertionError(f"Unhandled op in print_expr: {type(op)}")
 
     def print_op(self, op: Operation):
         """Dispatch an MLIR operation to the appropriate Fortran printer.
@@ -372,7 +374,9 @@ class ftnPrintContext:
                 self.variables[op.result] = op.global_name.root_reference.data
             case llvm.LoadOp():
                 # Propagate the pointer's name to the loaded value
-                self.variables[op.dereferenced_value] = self._get_variable_name_for(op.ptr)
+                self.variables[op.dereferenced_value] = self._get_variable_name_for(
+                    op.ptr
+                )
             case llvm.StoreOp():
                 if isa(op.ptr.type, MemRefType):
                     # Storing a loaded string value into a memref<?xi8> buffer:
@@ -390,7 +394,9 @@ class ftnPrintContext:
                     self._print_fn(name, bdy, ftyp)
             case func.CallOp(callee=tgt, arguments=args, res=results):
                 self._print_call(tgt, args, results)
-            case scf.IfOp(cond=conditional, true_region=true_bdy, false_region=false_bdy):
+            case scf.IfOp(
+                cond=conditional, true_region=true_bdy, false_region=false_bdy
+            ):
                 self._print_if(conditional, true_bdy, false_bdy)
             case memref.AllocOp():
                 pass  # Heap allocations are emitted via the StoreOp that uses the result
@@ -404,7 +410,9 @@ class ftnPrintContext:
                 src_name = self._get_variable_name_for(op.src)
                 self.variables[op.dest] = src_name
             case memref.StoreOp(value=val, memref=arr, indices=idxs):
-                if self._is_allocatable_char(arr.type) and isa(val.owner, memref.AllocOp):
+                if self._is_allocatable_char(arr.type) and isa(
+                    val.owner, memref.AllocOp
+                ):
                     # Storing a memref<?xi8> (string buffer) into memref<memref<?xi8>>
                     # (the allocatable out arg).  Emit allocate(suites(1)) and then
                     # assign from the name that SetStringOp registered for val
@@ -430,7 +438,7 @@ class ftnPrintContext:
                 dest_name = self._get_variable_name_for(op.dest)
                 self.print(f"write({dest_name}, '(3a)') \"{op.prefix.data}\", ", end="")
                 self.print_expr(op.var.owner)
-                self.print(f", \"{op.suffix.data}\"", use_prefix=False)
+                self.print(f', "{op.suffix.data}"', use_prefix=False)
             case CCPPArraySectionOp():
                 # Register the full Fortran array-section expression as the
                 # result's variable name so call-site printing emits it inline.
@@ -443,10 +451,17 @@ class ftnPrintContext:
                 self.variables[op.res] = f"{source_name}({', '.join(parts)})"
 
     # ISO_FORTRAN_ENV named constants recognised as kind values
-    _ISO_FORTRAN_ENV_KINDS: frozenset[str] = frozenset({
-        "REAL32", "REAL64", "REAL128",
-        "INT8", "INT16", "INT32", "INT64",
-    })
+    _ISO_FORTRAN_ENV_KINDS: frozenset[str] = frozenset(
+        {
+            "REAL32",
+            "REAL64",
+            "REAL128",
+            "INT8",
+            "INT16",
+            "INT32",
+            "INT64",
+        }
+    )
 
     def _print_module(self, module_name, body):
         """Print a builtin.ModuleOp as a Fortran module block.
@@ -477,7 +492,8 @@ class ftnPrintContext:
             iso_renames = ", ".join(
                 f"{op.kind_name.data} => {op.kind_value.data}"
                 for op in body.ops
-                if isa(op, CCPPKindDefOp) and op.kind_value.data in self._ISO_FORTRAN_ENV_KINDS
+                if isa(op, CCPPKindDefOp)
+                and op.kind_value.data in self._ISO_FORTRAN_ENV_KINDS
             )
             if iso_renames:
                 self.print(f"use ISO_FORTRAN_ENV, only: {iso_renames}", prefix="  ")
@@ -487,11 +503,7 @@ class ftnPrintContext:
         #   2. llvm.GlobalOp stubs with a 'module' attribute (host model vars).
         use_map: dict[str, list[str]] = {}
         for op in body.ops:
-            if (
-                isa(op, func.FuncOp)
-                and op.is_declaration
-                and "module" in op.attributes
-            ):
+            if isa(op, func.FuncOp) and op.is_declaration and "module" in op.attributes:
                 mod = op.attributes["module"].data
                 use_map.setdefault(mod, []).append(op.sym_name.data)
             elif isa(op, llvm.GlobalOp) and "module" in op.attributes:
@@ -525,10 +537,15 @@ class ftnPrintContext:
                     char_len = cast(llvm.LLVMArrayType, op.global_type).size.data
                 if is_const:
                     # Read-only string constants use the parameter attribute
-                    self.print(f"character(len={char_len}), parameter :: {name} = '{val}'", prefix="  ")
+                    self.print(
+                        f"character(len={char_len}), parameter :: {name} = '{val}'",
+                        prefix="  ",
+                    )
                 else:
                     # Mutable state variable (ccpp_suite_state) has no parameter
-                    self.print(f"character(len={char_len}) :: {name} = '{val}'", prefix="  ")
+                    self.print(
+                        f"character(len={char_len}) :: {name} = '{val}'", prefix="  "
+                    )
 
         # Emit one public :: line per subroutine definition that is marked public.
         public_procs = [
@@ -577,12 +594,14 @@ class ftnPrintContext:
         self.print(f"call {tgt.string_value()}(", end="")
         # Print input (in / inout) arguments by their variable names
         for idx, arg in enumerate(args):
-            if idx > 0: self.print(", ", end="", use_prefix=False)
+            if idx > 0:
+                self.print(", ", end="", use_prefix=False)
             self.print(self._get_variable_name_for(arg), end="", use_prefix=False)
 
         # Print output argument destinations, resolved via CopyOp uses
         for idx, res in enumerate(results, start=len(args)):
-            if idx > 0: self.print(", ", end="", use_prefix=False)
+            if idx > 0:
+                self.print(", ", end="", use_prefix=False)
             self.print(self.get_call_result_var_ssa(res), end="", use_prefix=False)
 
         self.print(")", use_prefix=False)
@@ -640,7 +659,11 @@ class ftnPrintContext:
                 for ret_val in op.arguments:
                     if isa(ret_val.owner, memref.AllocaOp):
                         # AllocaOp result → a true output argument
-                        out_name = ret_val.name_hint if ret_val.name_hint is not None else f"out_{len(output_names)}"
+                        out_name = (
+                            ret_val.name_hint
+                            if ret_val.name_hint is not None
+                            else f"out_{len(output_names)}"
+                        )
                         output_names.append(out_name)
                         output_ret_vals.append(ret_val)
                     else:
@@ -650,7 +673,8 @@ class ftnPrintContext:
 
         # Collect local allocas — AllocaOps whose result is not in the return list
         local_allocas = [
-            op for op in bdy.block.ops
+            op
+            for op in bdy.block.ops
             if isa(op, memref.AllocaOp) and op.memref not in output_ret_vals
         ]
 
@@ -694,7 +718,11 @@ class ftnPrintContext:
 
             # Declare local variables (non-returned allocas, e.g. computed scalars)
             for alloca_op in local_allocas:
-                var_name = alloca_op.memref.name_hint if alloca_op.memref.name_hint is not None else f"local_{id(alloca_op)}"
+                var_name = (
+                    alloca_op.memref.name_hint
+                    if alloca_op.memref.name_hint is not None
+                    else f"local_{id(alloca_op)}"
+                )
                 inner.variables[alloca_op.memref] = var_name
                 type_str = inner.mlir_type_to_ftn_type(alloca_op.memref.type)
                 inner.print(f"{type_str} :: {var_name}")
@@ -770,8 +798,8 @@ class ftnPrintContext:
             # No valid split point — emit as-is rather than produce invalid Fortran
             print(line, file=self.output)
             return
-        print(line[:split_pos + 1].ljust(_MAX_LINE_LEN - 1) + "&", file=self.output)
-        remainder = cont_prefix + line[split_pos + 1:].lstrip()
+        print(line[: split_pos + 1].ljust(_MAX_LINE_LEN - 1) + "&", file=self.output)
+        remainder = cont_prefix + line[split_pos + 1 :].lstrip()
         self._write_with_continuation(remainder, cont_prefix)
 
     def print_block(self, body: Block):

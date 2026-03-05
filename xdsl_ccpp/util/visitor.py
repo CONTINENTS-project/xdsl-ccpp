@@ -1,5 +1,6 @@
-from typing import Callable, List, Optional, Type, Union
 import re
+from collections.abc import Callable
+
 from xdsl.ir import Operation
 
 
@@ -8,7 +9,7 @@ def camel_to_snake(name):
     return pattern.sub("_", name).lower()
 
 
-def get_method(instance: object, method: str) -> Optional[Callable]:
+def get_method(instance: object, method: str) -> Callable | None:
     if not hasattr(instance, method):
         return None
     else:

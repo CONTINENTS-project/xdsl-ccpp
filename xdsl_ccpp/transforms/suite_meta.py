@@ -1,22 +1,21 @@
 from dataclasses import dataclass
-from xdsl.dialects import builtin, memref, func, arith, scf
+
 from xdsl.context import Context
+from xdsl.dialects import builtin, func
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
     GreedyRewritePatternApplier,
+    InsertPoint,
     PatternRewriter,
     PatternRewriteWalker,
     RewritePattern,
-    InsertPoint,
     op_type_rewrite_pattern,
 )
-from xdsl.ir import Block, Region
-from xdsl.rewriter import InsertPoint
 
-from xdsl_ccpp.util.visitor import Visitor
 from xdsl_ccpp.dialects import ccpp
-
-from xdsl_ccpp.transforms.util.ccpp_descriptors import CCPPType, CCPPTableProperties, CCPPArgumentTable, CCPPArgument, BuildMetaDataDescriptions
+from xdsl_ccpp.transforms.util.ccpp_descriptors import (
+    BuildMetaDataDescriptions,
+)
 from xdsl_ccpp.transforms.util.typing import TypeConversions
 
 
@@ -123,7 +122,9 @@ class MetaCAP(ModulePass):
                     in_args.append(arg_type)
                     out_args.append(arg_type)
                 else:
-                    assert False
+                    raise AssertionError(
+                        f"Unexpected intent: {fn_arg.getAttr('intent')}"
+                    )
             else:
                 # No intent specified — default to inout
                 in_args.append(arg_type)

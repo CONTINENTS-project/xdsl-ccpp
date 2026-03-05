@@ -25,8 +25,12 @@ class LowerStrCmp(RewritePattern):
         new_ops = []
         prev = None
         for idx in range(length):
-            lhs_byte = llvm.ExtractValueOp(DenseArrayBase.from_list(i64, [idx]), op.lhs, i8)
-            rhs_byte = llvm.ExtractValueOp(DenseArrayBase.from_list(i64, [idx]), op.rhs, i8)
+            lhs_byte = llvm.ExtractValueOp(
+                DenseArrayBase.from_list(i64, [idx]), op.lhs, i8
+            )
+            rhs_byte = llvm.ExtractValueOp(
+                DenseArrayBase.from_list(i64, [idx]), op.rhs, i8
+            )
             eq = arith.CmpiOp(lhs_byte.res, rhs_byte.res, 0)  # 0 = eq
             new_ops += [lhs_byte, rhs_byte, eq]
             if prev is None:

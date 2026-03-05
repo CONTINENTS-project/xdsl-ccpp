@@ -1,7 +1,7 @@
-from enum import Enum, StrEnum, auto
+from enum import StrEnum, auto
 
-from xdsl_ccpp.util.visitor import Visitor
 from xdsl_ccpp.dialects import ccpp
+from xdsl_ccpp.util.visitor import Visitor
 
 
 class CCPPType(StrEnum):
@@ -145,6 +145,7 @@ class CCPPArgument(CCPPItem):
 # IR → descriptor conversion (used in the IR after frontend parsing)
 # ---------------------------------------------------------------------------
 
+
 class XMLSuiteBase:
     """Lightweight node used to represent a suite hierarchy reconstructed from IR.
 
@@ -194,6 +195,7 @@ class XMLSuite(XMLSuiteBase):
 # ---------------------------------------------------------------------------
 # Visitor passes that walk CCPP IR and populate descriptor objects
 # ---------------------------------------------------------------------------
+
 
 class BuildMetaDataDescriptions(Visitor):
     """Visitor that walks CCPP metadata IR and builds `CCPPTableProperties` descriptors.

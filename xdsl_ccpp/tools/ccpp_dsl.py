@@ -38,7 +38,7 @@ class ccppMain:
             "--host-name",
             default=None,
             help="Override the CamelCase host name prefix for generated subroutines "
-                 "(e.g. 'HelloWorld'); derived from the suite name when not set",
+            "(e.g. 'HelloWorld'); derived from the suite name when not set",
         )
         parser.add_argument(
             "-t",
@@ -71,9 +71,7 @@ class ccppMain:
             options_db["host_files"] = []
 
         all_inputs = (
-            options_db["suites"]
-            + options_db["scheme_files"]
-            + options_db["host_files"]
+            options_db["suites"] + options_db["scheme_files"] + options_db["host_files"]
         )
         for f in all_inputs:
             if not os.path.exists(f):
@@ -159,7 +157,7 @@ class ccppMain:
             lines = section.splitlines()
             if not lines[0].startswith("// FILE:"):
                 continue
-            filename = lines[0][len("// FILE:"):].strip()
+            filename = lines[0][len("// FILE:") :].strip()
             body = "\n".join(lines[1:]).lstrip("\n") + "\n"
 
             if self.options_db["stdout"]:

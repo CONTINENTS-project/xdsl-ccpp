@@ -1,9 +1,17 @@
 import argparse
 import xml.etree.ElementTree as ET
 from enum import Enum, StrEnum, auto
+
 from xdsl.dialects.builtin import ModuleOp
 
-from xdsl_ccpp.dialects.ccpp import SuiteOp, GroupOp, SchemeOp, TablePropertiesOp, ArgumentTableOp, ArgumentOp
+from xdsl_ccpp.dialects.ccpp import (
+    ArgumentOp,
+    ArgumentTableOp,
+    GroupOp,
+    SchemeOp,
+    SuiteOp,
+    TablePropertiesOp,
+)
 
 
 class CCPPType(StrEnum):
@@ -141,6 +149,7 @@ class CCPPArgument(CCPPItem):
 # Suite XML parsing
 # ---------------------------------------------------------------------------
 
+
 class XMLSuiteBase:
     """Base node for the in-memory representation of a parsed suite XML file.
 
@@ -215,6 +224,7 @@ class XMLSuite(XMLSuiteBase):
 # Frontend driver
 # ---------------------------------------------------------------------------
 
+
 class ccppXML:
     """Frontend that parses CCPP suite XML and ``.meta`` files and emits MLIR IR.
 
@@ -237,9 +247,9 @@ class ccppXML:
         """State machine states for the line-oriented ``.meta`` file parser."""
 
         PROPERTIES = 1  # Inside a [ccpp-table-properties] block
-        ARG_TABLE = 2   # Inside a [ccpp-arg-table] header block
-        ARG = 3         # Inside a named argument [ arg_name ] block
-        NONE = 4        # Not yet inside any block
+        ARG_TABLE = 2  # Inside a [ccpp-arg-table] header block
+        ARG = 3  # Inside a named argument [ arg_name ] block
+        NONE = 4  # Not yet inside any block
 
     def initialise_argument_parser(self):
         """Create and return an `argparse.ArgumentParser` for the frontend CLI."""
@@ -333,7 +343,7 @@ class ccppXML:
 
                 if "[" in sline and "]" in sline:
                     # Strip brackets to get the section token
-                    token = sline.translate(str.maketrans('', '', "[]"))
+                    token = sline.translate(str.maketrans("", "", "[]"))
 
                     # Starting a new top-level section: flush any in-progress arg/table
                     if token == "ccpp-table-properties" or token == "ccpp-arg-table":
@@ -361,7 +371,9 @@ class ccppXML:
                         parse_state = ccppXML.MetaParseState.ARG
                         current_arg = CCPPArgument(token.strip())
                     else:
-                        assert False
+                        raise AssertionError(
+                            f"Unexpected token in arg table: {token!r}"
+                        )
                 else:
                     # Attribute line — one or more key = value pairs separated by '|'
                     # e.g. 'type = real | kind = kind_phys' or 'kind = len=512'
@@ -434,8 +446,12 @@ class ccppXML:
             args = []
             # Build an ArgumentOp for each argument in this entry point
             for fn_arg in table.getFunctionArguments():
-                args.append(ArgumentOp(fn_arg.name, fn_arg.getAttr("type"), fn_arg.getAttrs()))
-            tables.append(ArgumentTableOp(table.getAttr("name"), str(table.getAttr("type")), args))
+                args.append(
+                    ArgumentOp(fn_arg.name, fn_arg.getAttr("type"), fn_arg.getAttrs())
+                )
+            tables.append(
+                ArgumentTableOp(table.getAttr("name"), str(table.getAttr("type")), args)
+            )
         return TablePropertiesOp(
             meta.table_properties.getAttr("name"),
             str(meta.table_properties.getAttr("type")),

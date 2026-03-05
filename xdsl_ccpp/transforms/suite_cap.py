@@ -1,26 +1,28 @@
 from dataclasses import dataclass
 
-from xdsl.dialects import builtin, memref, func, arith, scf, llvm
-from xdsl.dialects.builtin import i8, StringAttr
 from xdsl.context import Context
+from xdsl.dialects import arith, builtin, func, llvm, memref, scf
+from xdsl.dialects.builtin import StringAttr, i8
+from xdsl.ir import Block, Region, SSAValue
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
     GreedyRewritePatternApplier,
+    InsertPoint,
     PatternRewriter,
     PatternRewriteWalker,
     RewritePattern,
-    InsertPoint,
     op_type_rewrite_pattern,
 )
-from xdsl.ir import Block, Region, SSAValue
 from xdsl.utils.hints import isa
 
-from xdsl_ccpp.util.visitor import Visitor
-from xdsl_ccpp.dialects import ccpp
-from xdsl_ccpp.dialects import ccpp_utils
-
-from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPArgument
+from xdsl_ccpp.dialects import ccpp, ccpp_utils
+from xdsl_ccpp.transforms.util.ccpp_descriptors import (
+    BuildMetaDataDescriptions,
+    BuildSchemeDescription,
+    CCPPArgument,
+)
 from xdsl_ccpp.transforms.util.typing import TypeConversions
+from xdsl_ccpp.util.visitor import Visitor
 
 
 class GatherMetaFunctionSignatures(Visitor):
@@ -78,7 +80,9 @@ class GenerateSuiteSubroutine(RewritePattern):
             arg_table = arg_tables[scheme_name]
             for fn_arg in arg_table.getFunctionArguments():
                 if fn_arg.name in args_required:
-                    assert fn_arg.getAttr("type") == args_required[fn_arg.name].getAttr("type")
+                    assert fn_arg.getAttr("type") == args_required[fn_arg.name].getAttr(
+                        "type"
+                    )
                 else:
                     args_required[fn_arg.name] = fn_arg
 
@@ -90,18 +94,16 @@ class GenerateSuiteSubroutine(RewritePattern):
             if arg_type == "character":
                 data_shape.append(int(arg.getAttr("kind").split("=")[1]))
 
-            alloc_ops[arg.name] = memref.AllocaOp.get(TypeConversions.getBaseType(arg_type), shape=data_shape)
+            alloc_ops[arg.name] = memref.AllocaOp.get(
+                TypeConversions.getBaseType(arg_type), shape=data_shape
+            )
         return alloc_ops
 
     def generateVariableInitialisations(self, data_ops):
         """Emit ops that zero-initialise errflg at the start of a subroutine."""
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
 
-        store_op = memref.StoreOp.get(
-            err_const,
-            data_ops["errflg"],
-            []
-        )
+        store_op = memref.StoreOp.get(err_const, data_ops["errflg"], [])
 
         return [err_const, store_op]
 
@@ -122,7 +124,9 @@ class GenerateSuiteSubroutine(RewritePattern):
                 in_ssa.append(data_ops[arg.name])
             if intent == "out" or intent == "inout":
                 val = data_ops[arg.name]
-                out_types.append(val.type if isinstance(val, SSAValue) else val.results[0].type)
+                out_types.append(
+                    val.type if isinstance(val, SSAValue) else val.results[0].type
+                )
                 out_tracking.append(val)
 
         assert len(out_types) == len(out_tracking)
@@ -151,7 +155,9 @@ class GenerateSuiteSubroutine(RewritePattern):
             value=StringAttr(string),
         )
 
-    def generateStateCheckOps(self, check_string: str, data_ops, fn_name: str | None = None):
+    def generateStateCheckOps(
+        self, check_string: str, data_ops, fn_name: str | None = None
+    ):
         """Emit ops that compare ccpp_suite_state against check_string.
 
         If the state does not match the expected value, errflg is set to 1
@@ -179,7 +185,8 @@ class GenerateSuiteSubroutine(RewritePattern):
         if fn_name is not None:
             trim_state = ccpp_utils.TrimOp(loaded_state)
             write_err = ccpp_utils.WriteErrMsgOp(
-                data_ops["errmsg"], trim_state.res,
+                data_ops["errmsg"],
+                trim_state.res,
                 "Invalid initial CCPP state, '",
                 f"' in {fn_name}",
             )
@@ -188,7 +195,16 @@ class GenerateSuiteSubroutine(RewritePattern):
             true_ops = [one, store, scf.YieldOp()]
         if_op = scf.IfOp(mismatch.result, [], true_ops)
 
-        return [addr_const, loaded_const, addr_state, loaded_state, strcmp_op, one_i1, mismatch, if_op]
+        return [
+            addr_const,
+            loaded_const,
+            addr_state,
+            loaded_state,
+            strcmp_op,
+            one_i1,
+            mismatch,
+            if_op,
+        ]
 
     def generateStateAssignment(self, state_string: str):
         """Emit ops that write state_string into the ccpp_suite_state global."""
@@ -200,7 +216,15 @@ class GenerateSuiteSubroutine(RewritePattern):
         store = llvm.StoreOp(loaded, addr_dst)
         return [addr_src, loaded, addr_dst, store]
 
-    def generateSubroutineCall(self, suite_description, tgt_subroutine_postfix, generated_subroutine_posfix=None, state_string: str | None = None, check_string: str | None = None, physics_mode: bool = False):
+    def generateSubroutineCall(
+        self,
+        suite_description,
+        tgt_subroutine_postfix,
+        generated_subroutine_posfix=None,
+        state_string: str | None = None,
+        check_string: str | None = None,
+        physics_mode: bool = False,
+    ):
         """Build a single cap subroutine as a func.FuncOp.
 
         tgt_subroutine_postfix  -- suffix appended to each scheme name to form
@@ -224,13 +248,17 @@ class GenerateSuiteSubroutine(RewritePattern):
         if tgt_subroutine_postfix is not None:
             # Fetch the argument table for each scheme's target subroutine
             for scheme_name in scheme_names:
-                arg_tables[scheme_name] = self.getArgumentTable(scheme_name, scheme_name + tgt_subroutine_postfix)
+                arg_tables[scheme_name] = self.getArgumentTable(
+                    scheme_name, scheme_name + tgt_subroutine_postfix
+                )
 
             # Collect unique args across all schemes, preserving first-seen order
             for scheme_name in scheme_names:
                 for fn_arg in arg_tables[scheme_name].getFunctionArguments():
                     if fn_arg.name in all_args:
-                        assert fn_arg.getAttr("type") == all_args[fn_arg.name].getAttr("type")
+                        assert fn_arg.getAttr("type") == all_args[fn_arg.name].getAttr(
+                            "type"
+                        )
                     else:
                         all_args[fn_arg.name] = fn_arg
 
@@ -241,10 +269,16 @@ class GenerateSuiteSubroutine(RewritePattern):
         def _has_dims(a):
             return a.hasAttr("dimensions") and a.getAttr("dimensions") > 0
 
-        input_arg_list = [a for a in all_args.values()
-                          if a.getAttr("intent") in ("in", "inout") or _has_dims(a)]
-        output_arg_list = [a for a in all_args.values()
-                           if a.getAttr("intent") == "out" and not _has_dims(a)]
+        input_arg_list = [
+            a
+            for a in all_args.values()
+            if a.getAttr("intent") in ("in", "inout") or _has_dims(a)
+        ]
+        output_arg_list = [
+            a
+            for a in all_args.values()
+            if a.getAttr("intent") == "out" and not _has_dims(a)
+        ]
 
         loop_ext_aliases: set = set()
         if physics_mode and any(a.name == "ncol" for a in input_arg_list):
@@ -254,11 +288,18 @@ class GenerateSuiteSubroutine(RewritePattern):
             # Collect other args sharing ncol's standard_name (e.g. 'nbox' in
             # temp_adjust_run also has standard_name = horizontal_loop_extent).
             # These are aliases for the column count and should not become block args.
-            ncol_std_name = ncol_meta.getAttr("standard_name") if ncol_meta.hasAttr("standard_name") else None
+            ncol_std_name = (
+                ncol_meta.getAttr("standard_name")
+                if ncol_meta.hasAttr("standard_name")
+                else None
+            )
             loop_ext_aliases = {
-                a.name for a in input_arg_list
-                if a.name != "ncol" and ncol_std_name
-                and a.hasAttr("standard_name") and a.getAttr("standard_name") == ncol_std_name
+                a.name
+                for a in input_arg_list
+                if a.name != "ncol"
+                and ncol_std_name
+                and a.hasAttr("standard_name")
+                and a.getAttr("standard_name") == ncol_std_name
             }
 
             def _make_col_arg(name):
@@ -273,7 +314,11 @@ class GenerateSuiteSubroutine(RewritePattern):
             input_arg_list = (
                 input_arg_list[:ncol_idx]
                 + [_make_col_arg("col_start"), _make_col_arg("col_end")]
-                + [a for a in input_arg_list[ncol_idx + 1:] if a.name not in loop_ext_aliases]
+                + [
+                    a
+                    for a in input_arg_list[ncol_idx + 1 :]
+                    if a.name not in loop_ext_aliases
+                ]
             )
 
         input_arg_types = [
@@ -300,7 +345,9 @@ class GenerateSuiteSubroutine(RewritePattern):
             data_shape = []
             if arg_type == "character":
                 data_shape.append(int(fn_arg.getAttr("kind").split("=")[1]))
-            alloc_op = memref.AllocaOp.get(TypeConversions.getBaseType(arg_type), shape=data_shape)
+            alloc_op = memref.AllocaOp.get(
+                TypeConversions.getBaseType(arg_type), shape=data_shape
+            )
             alloc_op.memref.name_hint = fn_arg.name
             alloc_ops[fn_arg.name] = alloc_op
             data_ops[fn_arg.name] = alloc_op
@@ -308,19 +355,25 @@ class GenerateSuiteSubroutine(RewritePattern):
         # errflg and errmsg must always be present regardless of whether scheme
         # functions are called (e.g. when tgt_subroutine_postfix is None)
         if "errflg" not in data_ops:
-            alloc_op = memref.AllocaOp.get(TypeConversions.getBaseType("integer"), shape=[])
+            alloc_op = memref.AllocaOp.get(
+                TypeConversions.getBaseType("integer"), shape=[]
+            )
             alloc_op.memref.name_hint = "errflg"
             alloc_ops["errflg"] = alloc_op
             data_ops["errflg"] = alloc_op
         if "errmsg" not in data_ops:
-            alloc_op = memref.AllocaOp.get(TypeConversions.getBaseType("character"), shape=[512])
+            alloc_op = memref.AllocaOp.get(
+                TypeConversions.getBaseType("character"), shape=[512]
+            )
             alloc_op.memref.name_hint = "errmsg"
             alloc_ops["errmsg"] = alloc_op
             data_ops["errmsg"] = alloc_op
 
         ncol_compute_ops = []
         if physics_mode and "col_start" in data_ops and "col_end" in data_ops:
-            ncol_alloc = memref.AllocaOp.get(TypeConversions.getBaseType("integer"), shape=[])
+            ncol_alloc = memref.AllocaOp.get(
+                TypeConversions.getBaseType("integer"), shape=[]
+            )
             ncol_alloc.memref.name_hint = "ncol"
             load_col_start = memref.LoadOp.get(data_ops["col_start"], [])
             load_col_end = memref.LoadOp.get(data_ops["col_end"], [])
@@ -331,7 +384,15 @@ class GenerateSuiteSubroutine(RewritePattern):
             data_ops["ncol"] = ncol_alloc
             for alias in loop_ext_aliases:
                 data_ops[alias] = ncol_alloc
-            ncol_compute_ops = [ncol_alloc, load_col_start, load_col_end, sub_op, one_const, add_op, store_ncol]
+            ncol_compute_ops = [
+                ncol_alloc,
+                load_col_start,
+                load_col_end,
+                sub_op,
+                one_const,
+                add_op,
+                store_ncol,
+            ]
 
         initialisation_ops = self.generateVariableInitialisations(data_ops)
 
@@ -341,34 +402,60 @@ class GenerateSuiteSubroutine(RewritePattern):
             # Emit a guarded call for each scheme in suite order
             for scheme_name in scheme_names:
                 assert scheme_name + tgt_subroutine_postfix in self.meta_fn_sigs
-                call_ops += self.generateSchemeSubroutineCallOps(scheme_name + tgt_subroutine_postfix, arg_tables[scheme_name], data_ops)
-                if scheme_name + tgt_subroutine_postfix not in fn_sigs:
-                    fn_sigs[scheme_name + tgt_subroutine_postfix] = self.meta_fn_sigs[scheme_name + tgt_subroutine_postfix]
+                full_name = scheme_name + tgt_subroutine_postfix
+                call_ops += self.generateSchemeSubroutineCallOps(
+                    full_name, arg_tables[scheme_name], data_ops
+                )
+                if full_name not in fn_sigs:
+                    fn_sigs[full_name] = self.meta_fn_sigs[full_name]
 
         # Scalar inout block args are returned so the caller receives the updated value.
         # Array inout args are modified in-place through the host's buffer, so they
         # do not need to be returned — the host observes the changes directly.
         inout_return_vals = [
-            data_ops[a.name] for a in input_arg_list
+            data_ops[a.name]
+            for a in input_arg_list
             if a.getAttr("intent") == "inout" and not _has_dims(a)
         ]
         alloc_return_vals = list(alloc_ops.values())
 
-        errmsg_fn_name = suite_description.attributes["name"] + generated_subroutine_posfix
-        check_ops = self.generateStateCheckOps(check_string, data_ops, errmsg_fn_name) if check_string is not None else []
-        state_ops = self.generateStateAssignment(state_string) if state_string is not None else []
+        errmsg_fn_name = (
+            suite_description.attributes["name"] + generated_subroutine_posfix
+        )
+        check_ops = (
+            self.generateStateCheckOps(check_string, data_ops, errmsg_fn_name)
+            if check_string is not None
+            else []
+        )
+        state_ops = (
+            self.generateStateAssignment(state_string)
+            if state_string is not None
+            else []
+        )
 
-        body_ops = alloc_return_vals + initialisation_ops + ncol_compute_ops + check_ops + call_ops + state_ops + [func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
+        body_ops = (
+            alloc_return_vals
+            + initialisation_ops
+            + ncol_compute_ops
+            + check_ops
+            + call_ops
+            + state_ops
+            + [func.ReturnOp(*inout_return_vals, *alloc_return_vals)]
+        )
 
         new_block.add_ops(body_ops)
         body = Region()
         body.add_block(new_block)
 
-        return_types = [v.type for v in inout_return_vals] + [o.results[0].type for o in alloc_return_vals]
+        return_types = [v.type for v in inout_return_vals] + [
+            o.results[0].type for o in alloc_return_vals
+        ]
 
         new_fn_type = builtin.FunctionType.from_lists(input_arg_types, return_types)
         new_func = func.FuncOp(
-            suite_description.attributes["name"] + "_suite" + generated_subroutine_posfix,
+            suite_description.attributes["name"]
+            + "_suite"
+            + generated_subroutine_posfix,
             new_fn_type,
             body,
             visibility="public",
@@ -384,7 +471,9 @@ class GenerateSuiteSubroutine(RewritePattern):
         object files.
         """
         return [
-            func.FuncOp.external(fd.sym_name.data, fd.function_type.inputs, fd.function_type.outputs)
+            func.FuncOp.external(
+                fd.sym_name.data, fd.function_type.inputs, fd.function_type.outputs
+            )
             for fd in func_defs
         ]
 
@@ -404,11 +493,11 @@ class GenerateSuiteSubroutine(RewritePattern):
         # Each tuple describes one cap subroutine:
         # (scheme postfix to call, generated name postfix, state to write, state to check)
         subroutine_specs = [
-            ("_init",     "_initialize",       "initialized",   "uninitialized"),
-            ("_finalize", "_finalize",          "uninitialized", "initialized"),
-            ("_run",      "_physics",           None,            "in_time_step"),
-            (None,        "_timestep_initial",  "in_time_step",  "initialized"),
-            (None,        "_timestep_final",    "initialized",   "in_time_step"),
+            ("_init", "_initialize", "initialized", "uninitialized"),
+            ("_finalize", "_finalize", "uninitialized", "initialized"),
+            ("_run", "_physics", None, "in_time_step"),
+            (None, "_timestep_initial", "in_time_step", "initialized"),
+            (None, "_timestep_final", "initialized", "in_time_step"),
         ]
 
         generated_fns = []
@@ -419,8 +508,11 @@ class GenerateSuiteSubroutine(RewritePattern):
         # Generate one FuncOp per subroutine spec and accumulate unique string values
         for tgt_postfix, gen_postfix, state_string, check_string in subroutine_specs:
             fn, sigs = self.generateSubroutineCall(
-                suite_description, tgt_postfix, gen_postfix,
-                state_string=state_string, check_string=check_string,
+                suite_description,
+                tgt_postfix,
+                gen_postfix,
+                state_string=state_string,
+                check_string=check_string,
                 physics_mode=(tgt_postfix == "_run"),
             )
             generated_fns.append(fn)
@@ -444,14 +536,18 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         # One read-only global per unique state string (shared by check and assign ops)
         all_strings_used = check_strings_used | state_strings_used
-        string_const_globals = [self.generateStringConstantGlobal(s) for s in sorted(all_strings_used)]
+        string_const_globals = [
+            self.generateStringConstantGlobal(s) for s in sorted(all_strings_used)
+        ]
 
         scheme_mod = builtin.ModuleOp(
             [ccpp_suite_state_global] + string_const_globals + generated_fns + fn_sigs,
             sym_name=builtin.StringAttr(op.suite_name.data + "_cap"),
         )
 
-        rewriter.insert_op(scheme_mod, InsertPoint.at_start(self.top_level_module.body.block))
+        rewriter.insert_op(
+            scheme_mod, InsertPoint.at_start(self.top_level_module.body.block)
+        )
 
 
 @dataclass(frozen=True)
@@ -469,7 +565,11 @@ class SuiteCAP(ModulePass):
     def find_ccpp_module(self, ops):
         """Return the named 'ccpp' ModuleOp from the given op list, or None."""
         for op in ops:
-            if isa(op, builtin.ModuleOp) and op.sym_name is not None and op.sym_name.data == "ccpp":
+            if (
+                isa(op, builtin.ModuleOp)
+                and op.sym_name is not None
+                and op.sym_name.data == "ccpp"
+            ):
                 return op
         return None
 
@@ -495,7 +595,9 @@ class SuiteCAP(ModulePass):
         PatternRewriteWalker(
             GreedyRewritePatternApplier(
                 [
-                    GenerateSuiteSubroutine(scheme_descriptions, meta_data_descriptions, meta_fn_sigs, op),
+                    GenerateSuiteSubroutine(
+                        scheme_descriptions, meta_data_descriptions, meta_fn_sigs, op
+                    ),
                 ]
             ),
             apply_recursively=False,

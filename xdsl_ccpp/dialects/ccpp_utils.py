@@ -1,6 +1,12 @@
-from xdsl.dialects.builtin import IntegerAttr, IntegerType, MemRefType, StringAttr, i1, i64
+from xdsl.dialects.builtin import IntegerAttr, IntegerType, MemRefType, StringAttr, i1
 from xdsl.dialects.llvm import LLVMArrayType
-from xdsl.ir import Dialect, ParametrizedAttribute, SSAValue, TypeAttribute, VerifyException
+from xdsl.ir import (
+    Dialect,
+    ParametrizedAttribute,
+    SSAValue,
+    TypeAttribute,
+    VerifyException,
+)
 from xdsl.irdl import (
     AttrSizedOperandSegments,
     IRDLOperation,
@@ -56,8 +62,13 @@ class StrCmpOp(IRDLOperation):
     literal = opt_prop_def(StringAttr)
     res = result_def(i1)
 
-    def __init__(self, lhs, rhs=None, length: int | None = None,
-                 literal: str | StringAttr | None = None):
+    def __init__(
+        self,
+        lhs,
+        rhs=None,
+        length: int | None = None,
+        literal: str | StringAttr | None = None,
+    ):
         if isinstance(literal, str):
             literal = StringAttr(literal)
         props: dict = {}
@@ -76,9 +87,13 @@ class StrCmpOp(IRDLOperation):
         has_length = self.length is not None
         has_literal = self.literal is not None
         if has_literal and (has_rhs or has_length):
-            raise VerifyException("StrCmpOp: literal cannot be combined with rhs or length")
+            raise VerifyException(
+                "StrCmpOp: literal cannot be combined with rhs or length"
+            )
         if not has_literal and not (has_rhs and has_length):
-            raise VerifyException("StrCmpOp: must have either (rhs and length) or literal")
+            raise VerifyException(
+                "StrCmpOp: must have either (rhs and length) or literal"
+            )
 
 
 @irdl_op_definition
@@ -100,7 +115,9 @@ class HostVarRefOp(IRDLOperation):
     module_name = prop_def(StringAttr)
     res = result_def()  # type set at construction to match callee expectation
 
-    def __init__(self, var_name: str | StringAttr, module_name: str | StringAttr, result_type):
+    def __init__(
+        self, var_name: str | StringAttr, module_name: str | StringAttr, result_type
+    ):
         if isinstance(var_name, str):
             var_name = StringAttr(var_name)
         if isinstance(module_name, str):
@@ -124,8 +141,8 @@ class WriteErrMsgOp(IRDLOperation):
 
     name = "ccpp_utils.write_errmsg"
 
-    dest = operand_def(MemRefType)                  # memref<512xi8>
-    var = operand_def(MemRefType | LLVMArrayType)   # memref<?xi8> or !llvm.array<N x i8>
+    dest = operand_def(MemRefType)  # memref<512xi8>
+    var = operand_def(MemRefType | LLVMArrayType)  # memref<?xi8> or !llvm.array<N x i8>
     prefix = prop_def(StringAttr)
     suffix = prop_def(StringAttr)
 
@@ -207,8 +224,8 @@ class SetStringOp(IRDLOperation):
 
     name = "ccpp_utils.set_string"
 
-    dest = operand_def(MemRefType)      # memref<?xi8>
-    src = operand_def(LLVMArrayType)   # !llvm.array<N x i8>
+    dest = operand_def(MemRefType)  # memref<?xi8>
+    src = operand_def(LLVMArrayType)  # !llvm.array<N x i8>
 
     def __init__(self, dest, src):
         super().__init__(operands=[dest, src])
@@ -238,6 +255,14 @@ class TrimOp(IRDLOperation):
 
 CCPPUtils = Dialect(
     "ccpp_utils",
-    [StrCmpOp, TrimOp, HostVarRefOp, WriteErrMsgOp, ArraySectionOp, KindDefOp, SetStringOp],
+    [
+        StrCmpOp,
+        TrimOp,
+        HostVarRefOp,
+        WriteErrMsgOp,
+        ArraySectionOp,
+        KindDefOp,
+        SetStringOp,
+    ],
     [RealKindType],
 )

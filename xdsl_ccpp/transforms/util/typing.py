@@ -1,9 +1,10 @@
 from xdsl.dialects import builtin, memref
 from xdsl.dialects.builtin import DYNAMIC_INDEX
+
 from xdsl_ccpp.dialects.ccpp_utils import RealKindType
 
 
-class TypeConversions():
+class TypeConversions:
     """Utility class that maps CCPP metadata type strings to xDSL/MLIR types.
 
     CCPP ``.meta`` files describe argument types using plain strings (e.g.

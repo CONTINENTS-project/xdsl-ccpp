@@ -1,16 +1,25 @@
 from dataclasses import dataclass
 
-from xdsl.dialects import builtin, memref, func, arith, scf, llvm
-from xdsl.dialects.builtin import i8, StringAttr, DYNAMIC_INDEX, IndexType, IntegerAttr
 from xdsl.context import Context
-from xdsl.passes import ModulePass
+from xdsl.dialects import arith, builtin, func, llvm, memref, scf
+from xdsl.dialects.builtin import DYNAMIC_INDEX, IndexType, IntegerAttr, StringAttr, i8
 from xdsl.ir import Block, Region
+from xdsl.passes import ModulePass
 from xdsl.utils.hints import isa
 
-from xdsl_ccpp.dialects import ccpp_utils
-from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp, StrCmpOp, TrimOp, HostVarRefOp, WriteErrMsgOp, SetStringOp
-
-from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions, BuildSchemeDescription, CCPPType
+from xdsl_ccpp.dialects.ccpp_utils import (
+    ArraySectionOp,
+    HostVarRefOp,
+    SetStringOp,
+    StrCmpOp,
+    TrimOp,
+    WriteErrMsgOp,
+)
+from xdsl_ccpp.transforms.util.ccpp_descriptors import (
+    BuildMetaDataDescriptions,
+    BuildSchemeDescription,
+    CCPPType,
+)
 from xdsl_ccpp.transforms.util.typing import TypeConversions
 
 
@@ -41,7 +50,11 @@ class CCPPCAP(ModulePass):
     def find_ccpp_module(self, ops):
         """Return the named 'ccpp' ModuleOp from the given op list, or None."""
         for op in ops:
-            if isa(op, builtin.ModuleOp) and op.sym_name is not None and op.sym_name.data == "ccpp":
+            if (
+                isa(op, builtin.ModuleOp)
+                and op.sym_name is not None
+                and op.sym_name.data == "ccpp"
+            ):
                 return op
         return None
 
@@ -104,11 +117,15 @@ class CCPPCAP(ModulePass):
         all_out_args = {}
         for scheme_name in scheme_names:
             table_name = scheme_name + table_postfix
-            assert table_name in meta_data[scheme_name].arg_tables, \
+            assert table_name in meta_data[scheme_name].arg_tables, (
                 f"No '{table_postfix}' arg table found for scheme '{scheme_name}'"
+            )
             arg_table = meta_data[scheme_name].getArgTable(table_name)
             for fn_arg in arg_table.getFunctionArguments():
-                if fn_arg.getAttr("intent") == "out" and fn_arg.name not in all_out_args:
+                if (
+                    fn_arg.getAttr("intent") == "out"
+                    and fn_arg.name not in all_out_args
+                ):
                     all_out_args[fn_arg.name] = fn_arg
 
         return [
@@ -121,8 +138,16 @@ class CCPPCAP(ModulePass):
         ]
 
     def _generate_lifecycle_fn(
-        self, fn_name, suite_name, suite_callee, call_ret_types,
-        suite_name_type, errmsg_type, errflg_type, char_base, int_base,
+        self,
+        fn_name,
+        suite_name,
+        suite_callee,
+        call_ret_types,
+        suite_name_type,
+        errmsg_type,
+        errflg_type,
+        char_base,
+        int_base,
         public_fns,
     ):
         """Build one CCPP cap lifecycle FuncOp and its external declaration.
@@ -169,26 +194,33 @@ class CCPPCAP(ModulePass):
             elif ret_type == errflg_type:
                 copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_alloc))
 
-        write_err = WriteErrMsgOp(errmsg_alloc, trim_suite_name.res, "No suite named ", "found")
+        write_err = WriteErrMsgOp(
+            errmsg_alloc, trim_suite_name.res, "No suite named ", "found"
+        )
         one_err = arith.ConstantOp.from_int_and_width(1, 32)
         store_errflg_err = memref.StoreOp.get(one_err, errflg_alloc, [])
 
         if_op = scf.IfOp(
-            string_eq_op.res, [],
+            string_eq_op.res,
+            [],
             [call_op] + copy_ops + [scf.YieldOp()],
             [write_err, one_err, store_errflg_err, scf.YieldOp()],
         )
 
         ret_op = func.ReturnOp(errmsg_alloc, errflg_alloc)
 
-        new_block.add_ops([
-            errmsg_alloc, errflg_alloc,
-            err_const, store_errflg,
-            trim_suite_name,
-            string_eq_op,
-            if_op,
-            ret_op,
-        ])
+        new_block.add_ops(
+            [
+                errmsg_alloc,
+                errflg_alloc,
+                err_const,
+                store_errflg,
+                trim_suite_name,
+                string_eq_op,
+                if_op,
+                ret_op,
+            ]
+        )
 
         body = Region()
         body.add_block(new_block)
@@ -205,9 +237,19 @@ class CCPPCAP(ModulePass):
         return cap_fn, decl
 
     def _generate_run_fn(
-        self, fn_name, suite_name, suite_part, suite_callee,
-        suite_name_type, errmsg_type, errflg_type, char_base, int_base,
-        public_fns, scheme_names, meta_data,
+        self,
+        fn_name,
+        suite_name,
+        suite_part,
+        suite_callee,
+        suite_name_type,
+        errmsg_type,
+        errflg_type,
+        char_base,
+        int_base,
+        public_fns,
+        scheme_names,
+        meta_data,
     ):
         """Build the CCPP cap physics run FuncOp and its external declaration.
 
@@ -230,8 +272,7 @@ class CCPPCAP(ModulePass):
         Returns ``(FuncOp, external_decl_FuncOp, host_global_ops)``.
         """
         assert suite_callee in public_fns, (
-            f"Suite callee '{suite_callee}' not found; "
-            f"available: {sorted(public_fns)}"
+            f"Suite callee '{suite_callee}' not found; available: {sorted(public_fns)}"
         )
         callee_module, callee_output_types, callee_input_types, callee_input_names = (
             public_fns[suite_callee]
@@ -246,7 +287,9 @@ class CCPPCAP(ModulePass):
                 continue
             if table_name not in meta_data[scheme_name].arg_tables:
                 continue
-            for fn_arg in meta_data[scheme_name].getArgTable(table_name).getFunctionArguments():
+            for fn_arg in (
+                meta_data[scheme_name].getArgTable(table_name).getFunctionArguments()
+            ):
                 if fn_arg.name not in std_name_of and fn_arg.hasAttr("standard_name"):
                     std_name_of[fn_arg.name] = fn_arg.getAttr("standard_name")
 
@@ -271,7 +314,9 @@ class CCPPCAP(ModulePass):
                 host_var_name, host_module_name = host_var_map[std_name]
                 # Assert the host variable is actually declared in that module.
                 assert host_var_name in (
-                    meta_data[host_module_name].arg_tables[host_module_name].function_arguments
+                    meta_data[host_module_name]
+                    .arg_tables[host_module_name]
+                    .function_arguments
                 ), (
                     f"Host variable '{host_var_name}' not found in "
                     f"'{host_module_name}' arg table"
@@ -320,7 +365,7 @@ class CCPPCAP(ModulePass):
         # 'module' attribute) per unique (host_var_name, module_name) pair so
         # the printer generates 'use <module>, only: <var>' in the preamble.
         host_var_ref_ops = []
-        host_var_ref_results = {}   # arg_name → SSA value
+        host_var_ref_results = {}  # arg_name → SSA value
         host_global_ops = []
         seen_host_globals: set = set()
 
@@ -329,7 +374,9 @@ class CCPPCAP(ModulePass):
         # look up bound variables (e.g. "pverp") by their host variable name.
         host_name_to_ref_result = {}
 
-        for i, (arg_name, arg_type) in enumerate(zip(callee_input_names, callee_input_types)):
+        for i, (arg_name, arg_type) in enumerate(
+            zip(callee_input_names, callee_input_types)
+        ):
             src = physics_arg_sources[i]
             if src[0] != "host":
                 continue
@@ -355,12 +402,14 @@ class CCPPCAP(ModulePass):
         # as its first dimension, wrap its HostVarRefOp result in an
         # ArraySectionOp encoding the Fortran slice col_start:col_end for dim 0
         # and 1:<dim_var> for each subsequent dimension.
-        array_section_pre_ops = []   # constant-1 op (created at most once)
-        array_section_extra_ops = [] # extra HostVarRefOps for dim bounds
+        array_section_pre_ops = []  # constant-1 op (created at most once)
+        array_section_extra_ops = []  # extra HostVarRefOps for dim bounds
         array_section_main_ops = []  # ArraySectionOps
         one_const_for_sections = None
 
-        for i, (arg_name, arg_type) in enumerate(zip(callee_input_names, callee_input_types)):
+        for i, (arg_name, arg_type) in enumerate(
+            zip(callee_input_names, callee_input_types)
+        ):
             src = physics_arg_sources[i]
             if src[0] != "host":
                 continue
@@ -368,7 +417,9 @@ class CCPPCAP(ModulePass):
 
             # Look up module variable descriptor to get dimension standard names
             try:
-                mod_arg_table = meta_data[host_module_name].getArgTable(host_module_name)
+                mod_arg_table = meta_data[host_module_name].getArgTable(
+                    host_module_name
+                )
                 host_var_desc = mod_arg_table.getFunctionArgument(host_var_name)
             except (KeyError, AssertionError):
                 continue
@@ -399,7 +450,8 @@ class CCPPCAP(ModulePass):
                 else:
                     # Need a fresh HostVarRefOp for this dimension variable
                     dim_ref_op = HostVarRefOp(
-                        dim_var_name, dim_module_name,
+                        dim_var_name,
+                        dim_module_name,
                         TypeConversions.getBaseType("integer"),
                     )
                     array_section_extra_ops.append(dim_ref_op)
@@ -435,7 +487,9 @@ class CCPPCAP(ModulePass):
             array_section_main_ops.append(section)
             host_var_ref_results[arg_name] = section.res
 
-        array_section_ops = array_section_pre_ops + array_section_extra_ops + array_section_main_ops
+        array_section_ops = (
+            array_section_pre_ops + array_section_extra_ops + array_section_main_ops
+        )
 
         # Build call args in callee order (mix of host refs / sections and block args).
         call_args = []
@@ -464,7 +518,8 @@ class CCPPCAP(ModulePass):
                 copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_arg))
 
         write_suite_part = WriteErrMsgOp(
-            errmsg_arg, trim_suite_part.res,
+            errmsg_arg,
+            trim_suite_part.res,
             "No suite part named ",
             f" found in suite {suite_name}",
         )
@@ -472,13 +527,15 @@ class CCPPCAP(ModulePass):
         store_errflg_inner = memref.StoreOp.get(one_inner, errflg_arg, [])
 
         inner_if = scf.IfOp(
-            suite_part_eq.res, [],
+            suite_part_eq.res,
+            [],
             [call_op] + copy_ops + [scf.YieldOp()],
             [write_suite_part, one_inner, store_errflg_inner, scf.YieldOp()],
         )
 
         write_suite_name = WriteErrMsgOp(
-            errmsg_arg, trim_suite_name.res,
+            errmsg_arg,
+            trim_suite_name.res,
             "No suite named ",
             "found",
         )
@@ -486,22 +543,26 @@ class CCPPCAP(ModulePass):
         store_errflg_outer = memref.StoreOp.get(one_outer, errflg_arg, [])
 
         outer_if = scf.IfOp(
-            suite_name_eq.res, [],
+            suite_name_eq.res,
+            [],
             [trim_suite_part, suite_part_eq, inner_if, scf.YieldOp()],
             [write_suite_name, one_outer, store_errflg_outer, scf.YieldOp()],
         )
 
         ret_op = func.ReturnOp(errmsg_arg, errflg_arg)
 
-        new_block.add_ops([
-            err_const, store_errflg,
-            *host_var_ref_ops,
-            *array_section_ops,
-            trim_suite_name,
-            suite_name_eq,
-            outer_if,
-            ret_op,
-        ])
+        new_block.add_ops(
+            [
+                err_const,
+                store_errflg,
+                *host_var_ref_ops,
+                *array_section_ops,
+                trim_suite_name,
+                suite_name_eq,
+                outer_if,
+                ret_op,
+            ]
+        )
 
         body = Region()
         body.add_block(new_block)
@@ -511,15 +572,23 @@ class CCPPCAP(ModulePass):
             [errmsg_type, errflg_type],
         )
         cap_fn = func.FuncOp(fn_name, fn_type, body, visibility="public")
-        decl = func.FuncOp.external(suite_callee, callee_input_types, callee_output_types)
+        decl = func.FuncOp.external(
+            suite_callee, callee_input_types, callee_output_types
+        )
         decl.attributes["module"] = StringAttr(callee_module)
         return cap_fn, decl, host_global_ops
 
     def _generate_suite_part_list_fn(
-        self, suite_name, part_names,
-        inner_char_type, allocatable_type,
-        suite_name_type, errmsg_type, errflg_type,
-        char_base, int_base,
+        self,
+        suite_name,
+        part_names,
+        inner_char_type,
+        allocatable_type,
+        suite_name_type,
+        errmsg_type,
+        errflg_type,
+        char_base,
+        int_base,
     ):
         """Build the ccpp_physics_suite_part_list FuncOp and its global string ops.
 
@@ -536,8 +605,13 @@ class CCPPCAP(ModulePass):
             str_global_name = f"str_{pn}"
             arr_type = llvm.LLVMArrayType.from_size_and_type(len(pn), i8)
             part_global_ops.append(
-                llvm.GlobalOp(arr_type, str_global_name, "internal",
-                              constant=True, value=StringAttr(pn))
+                llvm.GlobalOp(
+                    arr_type,
+                    str_global_name,
+                    "internal",
+                    constant=True,
+                    value=StringAttr(pn),
+                )
             )
             part_global_names[pn] = (str_global_name, arr_type)
 
@@ -562,36 +636,47 @@ class CCPPCAP(ModulePass):
         true_ops = []
         for pn in part_names:
             str_global_name, arr_type = part_global_names[pn]
-            str_len_const = arith.ConstantOp(IntegerAttr(len(pn), IndexType()), IndexType())
+            str_len_const = arith.ConstantOp(
+                IntegerAttr(len(pn), IndexType()), IndexType()
+            )
             str_alloc = memref.AllocOp([str_len_const.result], [], inner_char_type)
             addr_op = llvm.AddressOfOp(str_global_name, llvm.LLVMPointerType())
             load_op = llvm.LoadOp(addr_op, arr_type)
             set_str_op = SetStringOp(str_alloc.memref, load_op.dereferenced_value)
             store_ref_op = memref.StoreOp.get(str_alloc.memref, new_block.args[1], [])
-            true_ops.extend([str_len_const, str_alloc, addr_op, load_op, set_str_op, store_ref_op])
+            true_ops.extend(
+                [str_len_const, str_alloc, addr_op, load_op, set_str_op, store_ref_op]
+            )
         true_ops.append(scf.YieldOp())
 
         # False branch: error
-        write_err = WriteErrMsgOp(errmsg_alloc, trim_suite_name.res, "No suite named ", " found")
+        write_err = WriteErrMsgOp(
+            errmsg_alloc, trim_suite_name.res, "No suite named ", " found"
+        )
         one_err = arith.ConstantOp.from_int_and_width(1, 32)
         store_errflg_err = memref.StoreOp.get(one_err, errflg_alloc, [])
 
         if_op = scf.IfOp(
-            string_eq_op.res, [],
+            string_eq_op.res,
+            [],
             true_ops,
             [write_err, one_err, store_errflg_err, scf.YieldOp()],
         )
 
         ret_op = func.ReturnOp(errmsg_alloc, errflg_alloc)
 
-        new_block.add_ops([
-            errmsg_alloc, errflg_alloc,
-            err_const, store_errflg,
-            trim_suite_name,
-            string_eq_op,
-            if_op,
-            ret_op,
-        ])
+        new_block.add_ops(
+            [
+                errmsg_alloc,
+                errflg_alloc,
+                err_const,
+                store_errflg,
+                trim_suite_name,
+                string_eq_op,
+                if_op,
+                ret_op,
+            ]
+        )
 
         body = Region()
         body.add_block(new_block)
@@ -616,16 +701,18 @@ class CCPPCAP(ModulePass):
           - ``<CamelCase>_ccpp_physics_timestep_final``
           - ``<CamelCase>_ccpp_physics_run``
         """
-        camel_name = self.host_name if self.host_name is not None else self._derive_camel_case_name(suite_name)
+        camel_name = (
+            self.host_name
+            if self.host_name is not None
+            else self._derive_camel_case_name(suite_name)
+        )
 
         scheme_names = [
-            scheme.attributes["name"]
-            for group in suite_desc
-            for scheme in group
+            scheme.attributes["name"] for group in suite_desc for scheme in group
         ]
 
-        char_base = TypeConversions.getBaseType("character")   # i8
-        int_base = TypeConversions.getBaseType("integer")      # i32
+        char_base = TypeConversions.getBaseType("character")  # i8
+        int_base = TypeConversions.getBaseType("integer")  # i32
         suite_name_type = memref.MemRefType(char_base, [DYNAMIC_INDEX])
         errmsg_type = memref.MemRefType(char_base, [512])
         errflg_type = memref.MemRefType(int_base, [])
@@ -645,11 +732,11 @@ class CCPPCAP(ModulePass):
         # suite_part=None  → simple lifecycle dispatch (_generate_lifecycle_fn)
         # suite_part=str   → physics run dispatch (_generate_run_fn)
         lifecycle_specs = [
-            ("_ccpp_physics_initialize", "_init",     "_suite_initialize", None),
-            ("_ccpp_physics_finalize",   "_finalize",  "_suite_finalize",  None),
+            ("_ccpp_physics_initialize", "_init", "_suite_initialize", None),
+            ("_ccpp_physics_finalize", "_finalize", "_suite_finalize", None),
             ("_ccpp_physics_timestep_initial", None, "_suite_timestep_initial", None),
-            ("_ccpp_physics_timestep_final",   None, "_suite_timestep_final",   None),
-            ("_ccpp_physics_run",               None, "_suite_physics",    "physics"),
+            ("_ccpp_physics_timestep_final", None, "_suite_timestep_final", None),
+            ("_ccpp_physics_run", None, "_suite_physics", "physics"),
         ]
 
         all_globals: list = []
@@ -722,22 +809,33 @@ class CCPPCAP(ModulePass):
 
             # Module-level string constant for the suite name
             all_globals.append(
-                llvm.GlobalOp(arr_type, str_global_name, "internal",
-                              constant=True, value=StringAttr(sn))
+                llvm.GlobalOp(
+                    arr_type,
+                    str_global_name,
+                    "internal",
+                    constant=True,
+                    value=StringAttr(sn),
+                )
             )
 
             # Allocate the memref<?xi8> string buffer, then load the global
             # constant and hand it to SetStringOp which the printer uses to
             # resolve the assignment RHS (e.g. suites(1) = str_hello_world_suite).
-            str_len_const = arith.ConstantOp(IntegerAttr(str_len, IndexType()), IndexType())
+            str_len_const = arith.ConstantOp(
+                IntegerAttr(str_len, IndexType()), IndexType()
+            )
             str_alloc = memref.AllocOp([str_len_const.result], [], inner_char_type)
             addr_op = llvm.AddressOfOp(str_global_name, llvm.LLVMPointerType())
             load_op = llvm.LoadOp(addr_op, arr_type)
             set_str_op = SetStringOp(str_alloc.memref, load_op.dereferenced_value)
 
             # Store the memref<?xi8> reference into the allocatable argument
-            store_ref_op = memref.StoreOp.get(str_alloc.memref, suite_list_block.args[0], [])
-            body_ops.extend([str_len_const, str_alloc, addr_op, load_op, set_str_op, store_ref_op])
+            store_ref_op = memref.StoreOp.get(
+                str_alloc.memref, suite_list_block.args[0], []
+            )
+            body_ops.extend(
+                [str_len_const, str_alloc, addr_op, load_op, set_str_op, store_ref_op]
+            )
 
         suite_list_block.add_ops([*body_ops, func.ReturnOp()])
         suite_list_region = Region()
@@ -752,11 +850,13 @@ class CCPPCAP(ModulePass):
 
         # Generate ccpp_physics_suite_part_list.
         # Part names are the distinct suite_part values from the lifecycle specs.
-        part_names = list(dict.fromkeys(
-            suite_part
-            for _, _, _, suite_part in lifecycle_specs
-            if suite_part is not None
-        ))
+        part_names = list(
+            dict.fromkeys(
+                suite_part
+                for _, _, _, suite_part in lifecycle_specs
+                if suite_part is not None
+            )
+        )
         suite_part_list_fn, part_global_ops = self._generate_suite_part_list_fn(
             suite_name=suite_name,
             part_names=part_names,
@@ -805,4 +905,3 @@ class CCPPCAP(ModulePass):
                 suite_name, suite_desc, meta_data_descriptions, public_fns
             )
             op.body.block.add_op(cap_mod)
-

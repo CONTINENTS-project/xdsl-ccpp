@@ -1,17 +1,15 @@
 from dataclasses import dataclass
 
-from xdsl.dialects import builtin, memref, func, arith, scf
 from xdsl.context import Context
+from xdsl.dialects import builtin
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
     GreedyRewritePatternApplier,
     PatternRewriter,
     PatternRewriteWalker,
     RewritePattern,
-    InsertPoint,
     op_type_rewrite_pattern,
 )
-from xdsl.ir import Block, Region
 
 
 class EraseCCPP(RewritePattern):
