@@ -39,6 +39,23 @@ class RealKindType(ParametrizedAttribute, TypeAttribute):
         super().__init__(kind_name)
 
 
+@irdl_attr_definition
+class DerivedType(ParametrizedAttribute, TypeAttribute):
+    """MLIR type representing a Fortran derived data type (DDT).
+
+    Used for Fortran code generation only — carries the DDT name through
+    the IR so the printer can emit 'type(type_name)' declarations.
+    """
+
+    name = "ccpp_utils.derived_type"
+    type_name: StringAttr = param_def()
+
+    def __init__(self, type_name: str | StringAttr):
+        if isinstance(type_name, str):
+            type_name = StringAttr(type_name)
+        super().__init__(type_name)
+
+
 @irdl_op_definition
 class StrCmpOp(IRDLOperation):
     """String equality comparison.
@@ -264,5 +281,5 @@ CCPPUtils = Dialect(
         KindDefOp,
         SetStringOp,
     ],
-    [RealKindType],
+    [RealKindType, DerivedType],
 )

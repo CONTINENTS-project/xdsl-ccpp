@@ -23,6 +23,7 @@ from xdsl.ir import Attribute, Block, Operation, OpResult, Region, SSAValue
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp
+from xdsl_ccpp.dialects.ccpp_utils import DerivedType as CCPPDerivedType
 from xdsl_ccpp.dialects.ccpp_utils import HostVarRefOp as CCPPHostVarRefOp
 from xdsl_ccpp.dialects.ccpp_utils import KindDefOp as CCPPKindDefOp
 from xdsl_ccpp.dialects.ccpp_utils import RealKindType as CCPPRealKindType
@@ -183,6 +184,8 @@ class ftnPrintContext:
           - memref<NxT>     → character(len=N) for character, T(N) otherwise
         """
         match type_attr:
+            case CCPPDerivedType() as dt:
+                return f"type({dt.type_name.data})"
             case CCPPRealKindType() as rkt:
                 return f"real(kind={rkt.kind_name.data})"
             case Float32Type():
@@ -577,12 +580,15 @@ class ftnPrintContext:
 
         After a scheme subroutine call the MLIR IR contains a memref.CopyOp
         that copies each result into its destination storage.  This method
-        follows that use edge to find the destination variable name, which is
-        then printed as the output argument of the Fortran call.
+        follows that use edge to find the destination variable name.  If no
+        CopyOp is found the result was pre-registered as an anonymous local by
+        _print_fn and its name is looked up directly in self.variables.
         """
         for use in res_ssa.uses:
             if isa(use.operation, memref.CopyOp):
                 return self._get_variable_name_for(use.operation.destination)
+        # No CopyOp — must have been pre-registered as an anonymous local
+        return self.variables.get(res_ssa)
 
     def _print_call(self, tgt, args, results):
         """Print a func.CallOp as a Fortran subroutine call statement.
@@ -678,6 +684,22 @@ class ftnPrintContext:
             if isa(op, memref.AllocaOp) and op.memref not in output_ret_vals
         ]
 
+        # Collect call results that have no CopyOp consumer — they become anonymous locals
+        # (e.g. DDT outputs from init that the ccpp_cap doesn't route anywhere).
+        untracked_call_results: list[tuple[OpResult, str]] = []
+        for nested_op in bdy.block.walk():
+            if not isa(nested_op, func.CallOp):
+                continue
+            for res in nested_op.results:
+                has_copy = any(isa(u.operation, memref.CopyOp) for u in res.uses)
+                if not has_copy:
+                    hint = (
+                        res.name_hint
+                        if res.name_hint
+                        else f"_tmp_{len(untracked_call_results)}"
+                    )
+                    untracked_call_results.append((res, hint))
+
         args_str = ", ".join(input_names + output_names)
         start_signature = f"\nsubroutine {fn_name.data}({args_str})"
         end_signature = f"end subroutine {fn_name.data}"
@@ -726,6 +748,13 @@ class ftnPrintContext:
                 inner.variables[alloca_op.memref] = var_name
                 type_str = inner.mlir_type_to_ftn_type(alloca_op.memref.type)
                 inner.print(f"{type_str} :: {var_name}")
+
+            # Declare anonymous locals for call results that have no CopyOp consumer
+            for res, var_name in untracked_call_results:
+                inner.variables[res] = var_name
+                type_str = inner.mlir_type_to_ftn_type(res.type)
+                dim_suffix = inner._ftn_dim_suffix(res.type)
+                inner.print(f"{type_str} :: {var_name}{dim_suffix}")
 
             inner.print("")
 

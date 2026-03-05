@@ -1,7 +1,7 @@
 from xdsl.dialects import builtin, memref
 from xdsl.dialects.builtin import DYNAMIC_INDEX
 
-from xdsl_ccpp.dialects.ccpp_utils import RealKindType
+from xdsl_ccpp.dialects.ccpp_utils import DerivedType, RealKindType
 
 
 class TypeConversions:
@@ -89,10 +89,13 @@ class TypeConversions:
         """Return the MLIR scalar type for a CCPP type string.
 
         Args:
-            text_type: One of ``"character"``, ``"integer"``, or ``"real"``.
+            text_type: One of ``"character"``, ``"integer"``, ``"real"``, or a
+                       Fortran derived-type name (e.g. ``"vmr_type"``).
 
         Returns:
-            The corresponding xDSL builtin type (``i8``, ``i32``, or ``f64``).
+            The corresponding xDSL builtin type (``i8``, ``i32``, or ``f64``),
+            or a `DerivedType` for unknown types representing Fortran DDTs.
         """
-        assert text_type in cls.TEXT_TYPE_TO_MLIR_TYPE.keys()
-        return cls.TEXT_TYPE_TO_MLIR_TYPE[text_type]
+        if text_type in cls.TEXT_TYPE_TO_MLIR_TYPE:
+            return cls.TEXT_TYPE_TO_MLIR_TYPE[text_type]
+        return DerivedType(text_type)
