@@ -75,9 +75,11 @@ class TypeConversions:
             base_type = cls.getBaseType(text_type)
         if kind is not None and "len=" in kind:
             # A 'len=N' kind qualifier on a character type sets the string length.
+            # 'len=*' means assumed-length (dynamic); any integer N means fixed length.
             # Other kind values (e.g. 'kind_phys') are Fortran precision specifiers
             # and have no effect on the memref shape.
-            shape = [int(kind.split("=")[1])]
+            len_val = kind.split("=")[1]
+            shape = [DYNAMIC_INDEX if len_val == "*" else int(len_val)]
         elif dimensions > 0:
             # Each CCPP dimension maps to a dynamic-size axis in the memref;
             # the actual extent is provided by the host at runtime
