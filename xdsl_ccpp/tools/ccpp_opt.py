@@ -6,6 +6,7 @@ from xdsl.xdsl_opt_main import xDSLOptMain
 from xdsl_ccpp.dialects.ccpp import CCPP
 from xdsl_ccpp.dialects.ccpp_utils import CCPPUtils
 from xdsl_ccpp.transforms.ccpp_cap import CCPPCAP
+from xdsl_ccpp.transforms.fir_to_meta import FIRToMeta
 from xdsl_ccpp.transforms.generate_kinds import GenerateKinds
 from xdsl_ccpp.transforms.lower_ccpp_utils import LowerCCPPUtils
 from xdsl_ccpp.transforms.strip_ccpp import StripCCPP
@@ -24,6 +25,7 @@ class CCPPOptMain(xDSLOptMain):
         self.register_pass("generate-kinds", lambda: GenerateKinds)
         self.register_pass("strip-ccpp", lambda: StripCCPP)
         self.register_pass("lower-ccpp-utils", lambda: LowerCCPPUtils)
+        self.register_pass("fir-to-meta", lambda: FIRToMeta)
 
     def register_all_targets(self):
         super().register_all_targets()
