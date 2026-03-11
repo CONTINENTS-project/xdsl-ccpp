@@ -17,6 +17,7 @@ dev = [
 
 [project.scripts]
 ccpp_xdsl = "xdsl_ccpp.tools.ccpp_dsl:main"
+fir2meta = "xdsl_ccpp.tools.fir2meta:main"
 
 [tool.ruff]
 target-version = "py310"
