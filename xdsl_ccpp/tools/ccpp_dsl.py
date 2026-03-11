@@ -2,6 +2,24 @@ import argparse
 import os
 import sys
 
+from xdsl.context import Context
+from xdsl.dialects import builtin
+from xdsl.parser import Parser
+from xdsl.printer import Printer
+from xdsl.universe import Universe
+
+from xdsl_ccpp.dialects.ccpp import CCPP, TablePropertiesOp
+from xdsl_ccpp.dialects.ccpp_utils import CCPPUtils
+
+
+def _make_ctx() -> Context:
+    ctx = Context()
+    for name, factory in Universe.get_multiverse().all_dialects.items():
+        ctx.register_dialect(name, factory)
+    ctx.load_dialect(CCPP)
+    ctx.load_dialect(CCPPUtils)
+    return ctx
+
 
 class ccppMain:
     def initialise_argument_parser(self):
@@ -60,17 +78,27 @@ class ccppMain:
             default=1,
             help="Verbosity level: 0=quiet, 1=normal, 2=detailed (default: 1)",
         )
+        parser.add_argument(
+            "--meta-file",
+            default=None,
+            help="Optional metadata MLIR file (e.g. from fir2meta) whose "
+            "ccpp.table_properties are merged into the ccpp module before "
+            "the optimizer runs",
+        )
 
     def build_options_db_from_args(self, args):
         options_db = args.__dict__
 
         if not options_db.get("suites"):
             raise ValueError("--suites is required")
-        if not options_db.get("scheme_files"):
-            raise ValueError("--scheme-files is required")
+        if not options_db.get("scheme_files") and not options_db.get("meta_file"):
+            raise ValueError("--scheme-files is required (or provide --meta-file)")
 
         options_db["suites"] = options_db["suites"].split(",")
-        options_db["scheme_files"] = options_db["scheme_files"].split(",")
+        if options_db["scheme_files"]:
+            options_db["scheme_files"] = options_db["scheme_files"].split(",")
+        else:
+            options_db["scheme_files"] = []
         if options_db["host_files"]:
             options_db["host_files"] = options_db["host_files"].split(",")
         else:
@@ -79,6 +107,8 @@ class ccppMain:
         all_inputs = (
             options_db["suites"] + options_db["scheme_files"] + options_db["host_files"]
         )
+        if options_db.get("meta_file"):
+            all_inputs = all_inputs + [options_db["meta_file"]]
         for f in all_inputs:
             if not os.path.exists(f):
                 raise FileNotFoundError(f"Input file not found: '{f}'")
@@ -106,14 +136,12 @@ class ccppMain:
 
     def run_frontend(self, tmp_dir):
         suites_arg = ",".join(self.options_db["suites"])
-        scheme_files_arg = ",".join(self.options_db["scheme_files"])
         mlir_out = os.path.join(tmp_dir, "ccpp.mlir")
 
-        cmd = (
-            f"python3 -m xdsl_ccpp.frontend.ccpp_xml"
-            f' --suites "{suites_arg}"'
-            f' --scheme-files "{scheme_files_arg}"'
-        )
+        cmd = f'python3 -m xdsl_ccpp.frontend.ccpp_xml --suites "{suites_arg}"'
+        if self.options_db["scheme_files"]:
+            scheme_files_arg = ",".join(self.options_db["scheme_files"])
+            cmd += f' --scheme-files "{scheme_files_arg}"'
         if self.options_db["host_files"]:
             host_files_arg = ",".join(self.options_db["host_files"])
             cmd += f' --host-files "{host_files_arg}"'
@@ -126,6 +154,57 @@ class ccppMain:
         os.system(cmd)
         self.post_stage_check(mlir_out)
         return mlir_out
+
+    def merge_meta(self, mlir_file):
+        """Append ``ccpp.table_properties`` from the ``--meta-file`` into *mlir_file*.
+
+        The metadata file (produced by ``fir2meta``) contains a top-level
+        ``builtin.module`` wrapping a ``builtin.module @ccpp_meta`` that holds
+        one or more ``ccpp.table_properties`` ops.  This method extracts those
+        ops and appends them to the top-level module of *mlir_file* so that
+        the subsequent ``generate-meta-cap`` pass sees them alongside the ops
+        from the ``.meta`` scheme files.
+        """
+        meta_path = self.options_db["meta_file"]
+        self.print_verbose_message(
+            f"Merging metadata from '{meta_path}'",
+            f"Merging ccpp.table_properties from '{meta_path}' into '{mlir_file}'",
+        )
+
+        ctx = _make_ctx()
+        with open(mlir_file) as f:
+            ccpp_module = Parser(ctx, f.read()).parse_op()
+
+        with open(meta_path) as f:
+            meta_module = Parser(_make_ctx(), f.read()).parse_op()
+
+        # Extract ccpp.table_properties from the first sub-module in meta_module
+        table_props = []
+        for child in meta_module.body.block.ops:
+            if not isinstance(child, builtin.ModuleOp):
+                continue
+            for op in list(child.body.block.ops):
+                if isinstance(op, TablePropertiesOp):
+                    op.detach()
+                    table_props.append(op)
+            break  # only the first sub-module
+
+        if not table_props:
+            self.print_verbose_message(
+                f"Warning: no ccpp.table_properties found in '{meta_path}'"
+            )
+            return
+
+        for prop in table_props:
+            ccpp_module.body.block.add_op(prop)
+
+        with open(mlir_file, "w") as f:
+            Printer(stream=f).print_op(ccpp_module)
+            f.write("\n")
+
+        self.print_verbose_message(
+            f"  -> Merged {len(table_props)} table_properties block(s)",
+        )
 
     def run_opt(self, tmp_dir, mlir_in):
         ftn_out = os.path.join(tmp_dir, "ccpp.ftn")
@@ -193,6 +272,8 @@ class ccppMain:
             os.makedirs(out_dir, exist_ok=True)
 
         mlir_file = self.run_frontend(tmp_dir)
+        if self.options_db.get("meta_file"):
+            self.merge_meta(mlir_file)
         ftn_file = self.run_opt(tmp_dir, mlir_file)
         self.split_fortran_output(ftn_file, out_dir)
 
