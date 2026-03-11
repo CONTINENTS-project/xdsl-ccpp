@@ -45,6 +45,7 @@ from xdsl.context import Context
 from xdsl.dialects import builtin
 from xdsl.dialects import func as func_dialect
 from xdsl.dialects.arith import ConstantOp
+from xdsl.dialects.builtin import StringAttr
 from xdsl.ir import Block, Operation
 from xdsl.passes import ModulePass
 
@@ -307,6 +308,17 @@ def _build_arg_table(
     return ArgumentTableOp(table_name, "scheme", arg_ops)
 
 
+def _find_ccpp_module(op: builtin.ModuleOp) -> builtin.ModuleOp | None:
+    """Return the first named sub-``ModuleOp`` that contains CCPP ops, or None."""
+    for child in op.body.block.ops:
+        if not isinstance(child, builtin.ModuleOp):
+            continue
+        for grandchild in child.body.block.ops:
+            if isinstance(grandchild, TablePropertiesOp):
+                return child
+    return None
+
+
 @dataclass(frozen=True)
 class FIRToMeta(ModulePass):
     """Generate CCPP metadata (table_properties / arg_table / arg) from FIR.
@@ -316,18 +328,30 @@ class FIRToMeta(ModulePass):
     ``ccpp.table_properties`` block per unique Fortran module, containing one
     ``ccpp.arg_table`` per procedure.
 
-    The generated ops are inserted directly into the top-level module so that
-    the standard ``generate-meta-cap`` pass can process them next.
+    The generated CCPP ops are placed in a named ``@ccpp_meta`` sub-module (or
+    appended to an existing sub-module that already contains CCPP ops).  All
+    FIR content in the top-level module is then removed, leaving only the CCPP
+    sub-module.
     """
 
     name = "fir-to-meta"
 
     def apply(self, ctx: Context, op: builtin.ModuleOp) -> None:
-        # Collect all mangled func ops grouped by Fortran module name
+        # Find any existing CCPP sub-module before scanning, so we can exclude
+        # it from the FIR-removal step.
+        existing_ccpp_mod = _find_ccpp_module(op)
+
+        # Record all ops that are NOT the existing CCPP sub-module; these are
+        # the FIR ops to remove after the metadata has been extracted.
+        fir_ops = [
+            child for child in op.body.block.ops if child is not existing_ccpp_mod
+        ]
+
+        # Collect all mangled func ops grouped by Fortran module name.
         # module_name → [(proc_name, FuncOp), ...]
         by_module: dict[str, list[tuple[str, func_dialect.FuncOp]]] = defaultdict(list)
 
-        for fn_op in op.body.block.ops:
+        for fn_op in fir_ops:
             if not isinstance(fn_op, func_dialect.FuncOp):
                 continue
             sym_name_attr = fn_op.sym_name
@@ -341,11 +365,33 @@ class FIRToMeta(ModulePass):
             proc_name = m.group(2)
             by_module[module_name].append((proc_name, fn_op))
 
-        # Emit one ccpp.table_properties per Fortran module
+        # Build one ccpp.table_properties per Fortran module.
+        new_table_props: list[Operation] = []
         for module_name, procs in by_module.items():
             arg_tables: list[Operation] = []
             for proc_name, fn_op in procs:
                 arg_table = _build_arg_table(fn_op, proc_name, module_name, proc_name)
                 arg_tables.append(arg_table)
-            table_props = TablePropertiesOp(module_name, "scheme", arg_tables)
-            op.body.block.add_op(table_props)
+            new_table_props.append(TablePropertiesOp(module_name, "scheme", arg_tables))
+
+        # Use the existing CCPP sub-module or create a new one.
+        ccpp_mod = existing_ccpp_mod
+        if ccpp_mod is None:
+            ccpp_mod = builtin.ModuleOp([], sym_name=StringAttr("ccpp_meta"))
+            op.body.block.add_op(ccpp_mod)
+
+        for table_props in new_table_props:
+            ccpp_mod.body.block.add_op(table_props)
+
+        # Remove all FIR ops that were present before this pass ran.
+        for fir_op in fir_ops:
+            fir_op.detach()
+
+        # Strip FIR-origin module-level attributes (dlti, llvm, fir.*) so the
+        # output is clean CCPP IR.
+        fir_attr_prefixes = ("dlti.", "fir.", "llvm.", "hlfir.")
+        to_remove = [
+            k for k in op.attributes if any(k.startswith(p) for p in fir_attr_prefixes)
+        ]
+        for k in to_remove:
+            op.attributes.pop(k)
