@@ -2,7 +2,15 @@ from dataclasses import dataclass
 
 from xdsl.context import Context
 from xdsl.dialects import arith, builtin, llvm, memref, scf
-from xdsl.dialects.builtin import DenseArrayBase, IndexType, IntegerAttr, i1, i8, i64
+from xdsl.dialects.builtin import (
+    DenseArrayBase,
+    IndexType,
+    IntegerAttr,
+    i1,
+    i8,
+    i64,
+)
+from xdsl.dialects.llvm import LLVMArrayType
 from xdsl.ir import Block
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -13,7 +21,7 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from xdsl_ccpp.dialects.ccpp_utils import SetStringOp, StrCmpOp
+from xdsl_ccpp.dialects.ccpp_utils import SetStringOp, StrCmpOp, WriteErrMsgOp
 
 
 class LowerStrCmp(RewritePattern):
@@ -194,6 +202,114 @@ class LowerSetString(RewritePattern):
         rewriter.replace_matched_op(new_ops, [])
 
 
+class LowerWriteErrMsg(RewritePattern):
+    """Lower ``ccpp_utils.write_errmsg`` to byte-wise stores.
+
+    Semantics: ``dest = prefix + var + suffix``
+
+    ``prefix`` and ``suffix`` are compile-time string literals.  ``var`` is
+    either a ``memref<?xi8>`` (dynamic length, copied with an ``scf.for``
+    loop) or an ``!llvm.array<N x i8>`` (static length, copied with
+    ``llvm.extractvalue`` per byte).
+
+    The suffix start offset is ``len(prefix) + len(var)``; for the memref
+    case this is computed at runtime with ``arith.addi``.
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: WriteErrMsgOp, rewriter: PatternRewriter):
+        prefix_bytes = op.prefix.data.encode("ascii")
+        suffix_bytes = op.suffix.data.encode("ascii")
+        prefix_len = len(prefix_bytes)
+        suffix_len = len(suffix_bytes)
+
+        new_ops = []
+
+        # ── 1. Store prefix bytes ─────────────────────────────────────────────
+        for i, byte_val in enumerate(prefix_bytes):
+            idx = arith.ConstantOp(IntegerAttr(i, IndexType()), IndexType())
+            byte_op = arith.ConstantOp.from_int_and_width(byte_val, 8)
+            store = memref.StoreOp.get(byte_op.result, op.dest, [idx.result])
+            new_ops += [idx, byte_op, store]
+
+        # ── 2. Copy var bytes ─────────────────────────────────────────────────
+        if isinstance(op.var.type, LLVMArrayType):
+            # Static-length LLVM array — emit one extractvalue + store per byte
+            n = op.var.type.size.data
+            for i in range(n):
+                extract = llvm.ExtractValueOp(
+                    DenseArrayBase.from_list(i64, [i]), op.var, i8
+                )
+                idx = arith.ConstantOp(
+                    IntegerAttr(prefix_len + i, IndexType()), IndexType()
+                )
+                store = memref.StoreOp.get(extract.res, op.dest, [idx.result])
+                new_ops += [extract, idx, store]
+            var_len_op = arith.ConstantOp(IntegerAttr(n, IndexType()), IndexType())
+            new_ops.append(var_len_op)
+            prefix_len_op = arith.ConstantOp(
+                IntegerAttr(prefix_len, IndexType()), IndexType()
+            )
+            new_ops.append(prefix_len_op)
+            suffix_start_op = arith.AddiOp(prefix_len_op.result, var_len_op.result)
+            new_ops.append(suffix_start_op)
+            suffix_start = suffix_start_op.result
+        else:
+            # Dynamic memref<?xi8> — use scf.for to copy bytes
+            dim_idx_op = arith.ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+            var_dim_op = memref.DimOp.from_source_and_index(op.var, dim_idx_op.result)
+            prefix_len_op = arith.ConstantOp(
+                IntegerAttr(prefix_len, IndexType()), IndexType()
+            )
+            step_op = arith.ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+            new_ops += [dim_idx_op, var_dim_op, prefix_len_op, step_op]
+
+            # Body: load var[iv - prefix_len], store to dest[iv]
+            body_block = Block(arg_types=[IndexType()])
+            iv = body_block.args[0]
+            load_op = memref.LoadOp.get(op.var, [iv])
+            # Compute dest index = prefix_len_op.result + iv
+            # Actually iv runs from 0 to var_dim, and dest offset = prefix_len + iv
+            # We need to add prefix_len to iv inside the loop body.
+            prefix_offset_op = arith.ConstantOp(
+                IntegerAttr(prefix_len, IndexType()), IndexType()
+            )
+            dest_idx_op = arith.AddiOp(prefix_offset_op.result, iv)
+            store_op = memref.StoreOp.get(load_op.res, op.dest, [dest_idx_op.result])
+            body_block.add_ops(
+                [load_op, prefix_offset_op, dest_idx_op, store_op, scf.YieldOp()]
+            )
+
+            zero_op = arith.ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+            new_ops.append(zero_op)
+            for_op = scf.ForOp(
+                zero_op.result,
+                var_dim_op.result,
+                step_op.result,
+                [],
+                body_block,
+            )
+            new_ops.append(for_op)
+
+            # suffix_start = prefix_len + var_dim
+            suffix_start_op = arith.AddiOp(prefix_len_op.result, var_dim_op.result)
+            new_ops.append(suffix_start_op)
+            suffix_start = suffix_start_op.result
+
+        # ── 3. Store suffix bytes ─────────────────────────────────────────────
+        if suffix_len > 0:
+            for i, byte_val in enumerate(suffix_bytes):
+                i_op = arith.ConstantOp(IntegerAttr(i, IndexType()), IndexType())
+                dest_idx_op = arith.AddiOp(suffix_start, i_op.result)
+                byte_op = arith.ConstantOp.from_int_and_width(byte_val, 8)
+                store = memref.StoreOp.get(
+                    byte_op.result, op.dest, [dest_idx_op.result]
+                )
+                new_ops += [i_op, dest_idx_op, byte_op, store]
+
+        rewriter.replace_matched_op(new_ops, [])
+
+
 @dataclass(frozen=True)
 class LowerCCPPUtils(ModulePass):
     name = "lower-ccpp-utils"
@@ -201,6 +317,11 @@ class LowerCCPPUtils(ModulePass):
     def apply(self, ctx: Context, op: builtin.ModuleOp) -> None:
         PatternRewriteWalker(
             GreedyRewritePatternApplier(
-                [LowerStrCmp(), LowerStrCmpLiteral(), LowerSetString()]
+                [
+                    LowerStrCmp(),
+                    LowerStrCmpLiteral(),
+                    LowerSetString(),
+                    LowerWriteErrMsg(),
+                ]
             )
         ).rewrite_module(op)
