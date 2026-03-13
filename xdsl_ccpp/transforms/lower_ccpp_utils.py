@@ -15,7 +15,7 @@ from xdsl.dialects.builtin import (
     i8,
     i64,
 )
-from xdsl.dialects.llvm import LLVMArrayType
+from xdsl.dialects.llvm import AddressOfOp, LLVMArrayType, LLVMPointerType
 from xdsl.ir import Attribute, Block
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -27,6 +27,7 @@ from xdsl.pattern_rewriter import (
 )
 
 from xdsl_ccpp.dialects.ccpp_utils import (
+    HostVarRefOp,
     RealKindType,
     SetStringOp,
     StrCmpOp,
@@ -320,6 +321,21 @@ class LowerWriteErrMsg(RewritePattern):
         rewriter.replace_matched_op(new_ops, [])
 
 
+class LowerHostVarRef(RewritePattern):
+    """Lower ``ccpp_utils.host_var_ref`` to ``llvm.mlir.addressof``.
+
+    The Fortran global variable ``var_name`` from ``module_name`` is accessed
+    via the Flang-mangled symbol ``_QM{module_name}E{var_name}``.  The op is
+    replaced by an ``llvm.mlir.addressof`` that returns ``!llvm.ptr``.
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: HostVarRefOp, rewriter: PatternRewriter):
+        sym = f"_QM{op.module_name.data}E{op.var_name.data}"
+        addr = AddressOfOp(sym, LLVMPointerType())
+        rewriter.replace_matched_op(addr, [addr.result])
+
+
 def _replace_real_kind(t: Attribute) -> Attribute:
     """Recursively replace ``!ccpp_utils.real_kind<*>`` with ``f64``."""
     if isinstance(t, RealKindType):
@@ -369,6 +385,7 @@ class LowerCCPPUtils(ModulePass):
                     LowerStrCmpLiteral(),
                     LowerSetString(),
                     LowerWriteErrMsg(),
+                    LowerHostVarRef(),
                 ]
             )
         ).rewrite_module(op)
