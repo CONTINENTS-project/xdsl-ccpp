@@ -10,11 +10,13 @@ from xdsl.dialects.builtin import (
     IndexType,
     IntegerAttr,
     MemRefType,
+    UnrealizedConversionCastOp,
     f64,
     i1,
     i8,
     i64,
 )
+from xdsl.dialects.func import CallOp
 from xdsl.dialects.llvm import AddressOfOp, LLVMArrayType, LLVMPointerType
 from xdsl.ir import Attribute, Block
 from xdsl.passes import ModulePass
@@ -373,6 +375,123 @@ def _lower_real_kind_types(module: builtin.ModuleOp) -> None:
                         arg._type = new_t  # type: ignore[misc]
 
 
+def _lower_external_calls(module: builtin.ModuleOp) -> None:
+    """Lower ``memref`` arguments/results of external ``func.call`` ops to ``!llvm.ptr``.
+
+    A function is considered *internal* if a ``func.func`` definition (non-declaration)
+    with that name exists anywhere in the module tree.  Calls to internal functions
+    are left untouched; calls to truly external functions have their ``memref``-typed
+    operands wrapped in ``unrealized_conversion_cast … to !llvm.ptr`` and their
+    ``memref``-typed results cast back via ``unrealized_conversion_cast … to memref``.
+    The ``func.func`` external declaration signatures are updated in the same way.
+    """
+    # ── 1. Collect all internally-defined function names ─────────────────────
+    defined: set[str] = set()
+    for inner_op in module.walk():
+        if isinstance(inner_op, func_dialect.FuncOp) and not inner_op.is_declaration:
+            defined.add(inner_op.sym_name.data)
+
+    # ── 2. Update external func.func declaration signatures ──────────────────
+    for inner_op in module.walk():
+        if not (isinstance(inner_op, func_dialect.FuncOp) and inner_op.is_declaration):
+            continue
+        if inner_op.sym_name.data in defined:
+            continue
+        ft = inner_op.function_type
+        new_ins = [
+            LLVMPointerType() if isinstance(t, MemRefType) else t
+            for t in ft.inputs.data
+        ]
+        new_outs = [
+            LLVMPointerType() if isinstance(t, MemRefType) else t
+            for t in ft.outputs.data
+        ]
+        inner_op.properties["function_type"] = FunctionType(
+            ArrayAttr(new_ins), ArrayAttr(new_outs)
+        )
+
+    # ── 3. Lower external func.call ops ──────────────────────────────────────
+    calls_to_lower: list[CallOp] = [
+        op
+        for op in module.walk()
+        if isinstance(op, CallOp) and op.callee.root_reference.data not in defined
+    ]
+
+    for call_op in calls_to_lower:
+        block = call_op.parent
+
+        # Cast each memref argument to !llvm.ptr
+        pre_ops: list[UnrealizedConversionCastOp] = []
+        new_args = []
+        for arg in call_op.arguments:
+            if isinstance(arg.type, MemRefType):
+                cast = UnrealizedConversionCastOp.get([arg], [LLVMPointerType()])
+                pre_ops.append(cast)
+                new_args.append(cast.results[0])
+            else:
+                new_args.append(arg)
+
+        # Build new result types: memref → !llvm.ptr
+        orig_result_types = [r.type for r in call_op.results]
+        new_result_types = [
+            LLVMPointerType() if isinstance(t, MemRefType) else t
+            for t in orig_result_types
+        ]
+
+        new_call = CallOp(
+            call_op.callee.root_reference.data, new_args, new_result_types
+        )
+
+        # Cast each !llvm.ptr result back to the original memref type
+        post_ops: list[UnrealizedConversionCastOp] = []
+        final_results = []
+        for orig_t, new_res in zip(orig_result_types, new_call.results):
+            if isinstance(orig_t, MemRefType):
+                back = UnrealizedConversionCastOp.get([new_res], [orig_t])
+                post_ops.append(back)
+                final_results.append(back.results[0])
+            else:
+                final_results.append(new_res)
+
+        # Insert pre-casts, new call, post-casts; then replace and detach old call
+        block.insert_ops_before(pre_ops, call_op)
+        block.insert_op_before(new_call, call_op)
+        block.insert_ops_after(post_ops, new_call)
+        for old_res, final_res in zip(call_op.results, final_results):
+            old_res.replace_by(final_res)
+        call_op.detach()
+
+    # ── 4. Sync all declarations to match actual call-site argument types ──────
+    # Internal functions called with !llvm.ptr args (e.g. from host_var_ref
+    # lowering) need their local declarations updated to avoid type mismatches.
+    call_arg_types: dict[str, list[Attribute]] = {}
+    for inner_op in module.walk():
+        if isinstance(inner_op, CallOp):
+            name = inner_op.callee.root_reference.data
+            if name not in call_arg_types:
+                call_arg_types[name] = [arg.type for arg in inner_op.arguments]
+
+    for inner_op in module.walk():
+        if not (isinstance(inner_op, func_dialect.FuncOp) and inner_op.is_declaration):
+            continue
+        name = inner_op.sym_name.data
+        if name not in call_arg_types:
+            continue
+        ft = inner_op.function_type
+        new_ins = list(ft.inputs.data)
+        changed = False
+        for i, call_t in enumerate(call_arg_types[name]):
+            if i < len(new_ins) and isinstance(new_ins[i], MemRefType) and isinstance(
+                call_t, LLVMPointerType
+            ):
+                new_ins[i] = LLVMPointerType()
+                changed = True
+        if changed:
+            inner_op.properties["function_type"] = FunctionType(
+                ArrayAttr(new_ins), ArrayAttr(list(ft.outputs.data))
+            )
+
+
 @dataclass(frozen=True)
 class LowerCCPPUtils(ModulePass):
     name = "lower-ccpp-utils"
@@ -390,3 +509,4 @@ class LowerCCPPUtils(ModulePass):
             )
         ).rewrite_module(op)
         _lower_real_kind_types(op)
+        _lower_external_calls(op)
