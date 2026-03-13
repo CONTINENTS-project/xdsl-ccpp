@@ -2,16 +2,21 @@ from dataclasses import dataclass
 
 from xdsl.context import Context
 from xdsl.dialects import arith, builtin, llvm, memref, scf
+from xdsl.dialects import func as func_dialect
 from xdsl.dialects.builtin import (
+    ArrayAttr,
     DenseArrayBase,
+    FunctionType,
     IndexType,
     IntegerAttr,
+    MemRefType,
+    f64,
     i1,
     i8,
     i64,
 )
 from xdsl.dialects.llvm import LLVMArrayType
-from xdsl.ir import Block
+from xdsl.ir import Attribute, Block
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
     GreedyRewritePatternApplier,
@@ -21,7 +26,12 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from xdsl_ccpp.dialects.ccpp_utils import SetStringOp, StrCmpOp, WriteErrMsgOp
+from xdsl_ccpp.dialects.ccpp_utils import (
+    RealKindType,
+    SetStringOp,
+    StrCmpOp,
+    WriteErrMsgOp,
+)
 
 
 class LowerStrCmp(RewritePattern):
@@ -310,6 +320,43 @@ class LowerWriteErrMsg(RewritePattern):
         rewriter.replace_matched_op(new_ops, [])
 
 
+def _replace_real_kind(t: Attribute) -> Attribute:
+    """Recursively replace ``!ccpp_utils.real_kind<*>`` with ``f64``."""
+    if isinstance(t, RealKindType):
+        return f64
+    if isinstance(t, MemRefType) and isinstance(t.element_type, RealKindType):
+        return MemRefType(f64, t.shape, t.layout, t.memory_space)
+    if isinstance(t, FunctionType):
+        new_inputs = [_replace_real_kind(i) for i in t.inputs.data]
+        new_outputs = [_replace_real_kind(o) for o in t.outputs.data]
+        if new_inputs != list(t.inputs.data) or new_outputs != list(t.outputs.data):
+            return FunctionType(
+                ArrayAttr(new_inputs),
+                ArrayAttr(new_outputs),
+            )
+    return t
+
+
+def _lower_real_kind_types(module: builtin.ModuleOp) -> None:
+    """Walk the entire module and replace ``RealKindType`` with ``f64`` in all
+    SSA value types, block argument types, and ``func.func`` function types."""
+    for inner_op in module.walk():
+        for result in inner_op.results:
+            new_t = _replace_real_kind(result._type)
+            if new_t is not result._type:
+                result._type = new_t  # type: ignore[misc]
+        if isinstance(inner_op, func_dialect.FuncOp):
+            new_ft = _replace_real_kind(inner_op.function_type)
+            if new_ft is not inner_op.function_type:
+                inner_op.properties["function_type"] = new_ft
+        for region in inner_op.regions:
+            for block in region.blocks:
+                for arg in block.args:
+                    new_t = _replace_real_kind(arg._type)
+                    if new_t is not arg._type:
+                        arg._type = new_t  # type: ignore[misc]
+
+
 @dataclass(frozen=True)
 class LowerCCPPUtils(ModulePass):
     name = "lower-ccpp-utils"
@@ -325,3 +372,4 @@ class LowerCCPPUtils(ModulePass):
                 ]
             )
         ).rewrite_module(op)
+        _lower_real_kind_types(op)
