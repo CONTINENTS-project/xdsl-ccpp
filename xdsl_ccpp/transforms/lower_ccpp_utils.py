@@ -481,8 +481,10 @@ def _lower_external_calls(module: builtin.ModuleOp) -> None:
         new_ins = list(ft.inputs.data)
         changed = False
         for i, call_t in enumerate(call_arg_types[name]):
-            if i < len(new_ins) and isinstance(new_ins[i], MemRefType) and isinstance(
-                call_t, LLVMPointerType
+            if (
+                i < len(new_ins)
+                and isinstance(new_ins[i], MemRefType)
+                and isinstance(call_t, LLVMPointerType)
             ):
                 new_ins[i] = LLVMPointerType()
                 changed = True
