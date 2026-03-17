@@ -33,6 +33,7 @@ The output can be piped directly into ``ccpp_opt``::
 
 from __future__ import annotations
 
+import sys
 import types as _types
 from dataclasses import dataclass, field
 
@@ -46,6 +47,51 @@ from xdsl_ccpp.dialects.ccpp import (
     SuiteOp,
     TablePropertiesOp,
 )
+
+# ---------------------------------------------------------------------------
+# Compile-time parameter helper
+# ---------------------------------------------------------------------------
+
+
+def ccpp_param(name: str, default, type=int):
+    """Return a compile-time parameter, optionally overridden from the command line.
+
+    Scans ``sys.argv`` for a token of the form ``name=value``.  If found,
+    returns the value cast to *type*; otherwise returns *default*.  The value
+    is resolved when the Python script is executed (i.e. at IR-generation time)
+    and is baked into the generated Fortran as a fixed repetition count or
+    constant.
+
+    Typical use — define a default in the script and let callers override it::
+
+        top = ccpp_param("top", default=19)
+
+        @ccpp_suite("my_suite")
+        class my_suite:
+            physics = [hello_scheme]
+            def run():
+                for i in range(0, top):
+                    hello_scheme()
+
+    Default run::
+
+        python3 my_suite.py            # top=19
+
+    CLI override (any value the user provides)::
+
+        python3 my_suite.py top=53     # top=53
+
+    Args:
+        name:    Parameter name, matched against ``key=value`` tokens in argv.
+        default: Value returned when the parameter is absent from argv.
+        type:    Callable used to coerce the string value (default: ``int``).
+    """
+    prefix = f"{name}="
+    for token in sys.argv[1:]:
+        if token.startswith(prefix):
+            return type(token[len(prefix) :])
+    return default
+
 
 # Class attribute names recognised as scheme entry points.
 # Each name maps to the suffix appended to the scheme name in Fortran,
@@ -234,6 +280,11 @@ def _run_groups(
       the output, preserving the group name.
     - **Scheme name** (e.g. ``hello_scheme()``) — adds that scheme to its parent
       group (the group whose list it appeared in).
+
+    All standard Python control flow (``for``, ``while``, ``if``) works as
+    normal because the function body is executed directly.  Module-level
+    variables (including those produced by :func:`ccpp_param`) are accessible
+    inside ``run`` because the original ``__globals__`` dict is preserved.
     """
     # Map each scheme name to its parent group name and descriptor.
     scheme_to_group: dict[str, str] = {}
@@ -320,6 +371,17 @@ def ccpp_suite(name: str, version: str = "1.0"):
             physics = [hello_scheme, temp_adjust]
             def run():
                 hello_scheme()   # temp_adjust is skipped
+
+        # Repeat a scheme N times using a loop.
+        # N can be a module-level constant or a ccpp_param() value.
+        top = ccpp_param("top", default=10)   # override: python3 suite.py top=53
+
+        @ccpp_suite("loop_suite", version="1.0")
+        class loop_suite:
+            physics = [hello_scheme]
+            def run():
+                for i in range(0, top):
+                    hello_scheme()
     """
 
     def decorator(cls) -> SuiteDescriptor:
