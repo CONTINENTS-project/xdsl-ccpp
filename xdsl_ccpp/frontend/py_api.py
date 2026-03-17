@@ -187,11 +187,12 @@ class SuiteDescriptor:
         self,
         name: str,
         version: str,
-        groups: dict[str, list[SchemeDescriptor]],
+        groups: dict[str, list[tuple[SchemeDescriptor, dict[str, str]]]],
     ):
         self.name = name
         self.version = version
-        # Maps group name → list of SchemeDescriptor objects (definition order).
+        # Maps group name → list of (SchemeDescriptor, overrides) pairs.
+        # overrides is a {arg_name: literal_str} dict, empty when no overrides.
         self.groups = groups
 
 
@@ -271,7 +272,7 @@ def ccpp_host(cls) -> TableDescriptor:
 def _run_groups(
     run_fn,
     groups: dict[str, list[SchemeDescriptor]],
-) -> dict[str, list[SchemeDescriptor]]:
+) -> dict[str, list[tuple[SchemeDescriptor, dict[str, str]]]]:
     """Execute *run_fn* in a recording namespace to determine group contents.
 
     Callable names available inside ``run``:
@@ -279,7 +280,8 @@ def _run_groups(
     - **Group name** (e.g. ``physics()``) — adds all schemes from that group to
       the output, preserving the group name.
     - **Scheme name** (e.g. ``hello_scheme()``) — adds that scheme to its parent
-      group (the group whose list it appeared in).
+      group (the group whose list it appeared in).  Keyword arguments become
+      compile-time literal overrides (e.g. ``hello_scheme(var_a=92)``).
 
     All standard Python control flow (``for``, ``while``, ``if``) works as
     normal because the function body is executed directly.  Module-level
@@ -296,13 +298,13 @@ def _run_groups(
 
     default_group = next(iter(groups)) if groups else "physics"
 
-    # Recording state: ordered dict of group_name → scheme list.
-    output: dict[str, list[SchemeDescriptor]] = {}
+    # Recording state: ordered dict of group_name → (descriptor, overrides) list.
+    output: dict[str, list[tuple[SchemeDescriptor, dict[str, str]]]] = {}
 
-    def _add(group_name: str, sd: SchemeDescriptor) -> None:
+    def _add(group_name: str, sd: SchemeDescriptor, overrides: dict[str, str]) -> None:
         if group_name not in output:
             output[group_name] = []
-        output[group_name].append(sd)
+        output[group_name].append((sd, overrides))
 
     # Build the recording namespace.
     namespace: dict = {}
@@ -312,7 +314,7 @@ def _run_groups(
         def _make_group_caller(gname, gschemes):
             def _caller():
                 for sd in gschemes:
-                    _add(gname, sd)
+                    _add(gname, sd, {})
 
             return _caller
 
@@ -321,8 +323,9 @@ def _run_groups(
     for scheme_name, sd in all_schemes.items():
 
         def _make_scheme_caller(sname, ssd):
-            def _caller():
-                _add(scheme_to_group.get(sname, default_group), ssd)
+            def _caller(**kwargs):
+                overrides = {k: str(v) for k, v in kwargs.items()}
+                _add(scheme_to_group.get(sname, default_group), ssd, overrides)
 
             return _caller
 
@@ -385,13 +388,15 @@ def ccpp_suite(name: str, version: str = "1.0"):
     """
 
     def decorator(cls) -> SuiteDescriptor:
-        groups: dict[str, list[SchemeDescriptor]] = {}
+        raw_groups: dict[str, list[SchemeDescriptor]] = {}
         for attr_name, val in cls.__dict__.items():
             if not attr_name.startswith("_") and isinstance(val, list):
-                groups[attr_name] = val
+                raw_groups[attr_name] = val
         run_fn = cls.__dict__.get("run")
         if run_fn is not None:
-            groups = _run_groups(run_fn, groups)
+            groups = _run_groups(run_fn, raw_groups)
+        else:
+            groups = {k: [(sd, {}) for sd in v] for k, v in raw_groups.items()}
         return SuiteDescriptor(name, version, groups)
 
     return decorator
@@ -445,9 +450,11 @@ def build_ir(
     group_ops = []
     seen_schemes: dict[str, SchemeDescriptor] = {}
     for group_name, scheme_list in suite.groups.items():
-        scheme_ops = [SchemeOp(sd.name) for sd in scheme_list]
+        scheme_ops = [
+            SchemeOp(sd.name, overrides or None) for sd, overrides in scheme_list
+        ]
         group_ops.append(GroupOp(group_name, scheme_ops))
-        for sd in scheme_list:
+        for sd, _ in scheme_list:
             seen_schemes.setdefault(sd.name, sd)
     ir_ops.append(SuiteOp(suite.name, group_ops, suite.version))
 

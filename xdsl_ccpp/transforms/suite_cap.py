@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from xdsl.context import Context
 from xdsl.dialects import arith, builtin, func, llvm, memref, scf
-from xdsl.dialects.builtin import StringAttr, i8
+from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, StringAttr, i8
 from xdsl.ir import Block, Region, SSAValue
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -16,6 +16,7 @@ from xdsl.pattern_rewriter import (
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects import ccpp, ccpp_utils
+from xdsl_ccpp.dialects.ccpp_utils import KeywordCallOp
 from xdsl_ccpp.transforms.util.ccpp_descriptors import (
     BuildMetaDataDescriptions,
     BuildSchemeDescription,
@@ -55,13 +56,21 @@ class GenerateSuiteSubroutine(RewritePattern):
         self.top_level_module = top_level_module
 
     def getSchemeNames(self, suite_description):
-        """Return a flat list of scheme names from all groups in the suite."""
-        scheme_names = []
-        # Iterate groups then schemes within each group
+        """Return a flat list of (scheme_name, overrides) pairs from all groups.
+
+        ``overrides`` is a plain ``{arg_name: literal_str}`` dict, empty when
+        the scheme was not called with keyword argument overrides.
+        """
+        result = []
         for group in suite_description:
             for scheme in group:
-                scheme_names.append(scheme.attributes["name"])
-        return scheme_names
+                result.append(
+                    (
+                        scheme.attributes["name"],
+                        scheme.attributes.get("arg_overrides", {}),
+                    )
+                )
+        return result
 
     def getArgumentTable(self, scheme_name, subroutine_name):
         """Look up the argument table for a specific scheme subroutine.
@@ -112,7 +121,9 @@ class GenerateSuiteSubroutine(RewritePattern):
 
         return [err_const, store_op]
 
-    def generateSchemeSubroutineCallOps(self, subroutine_name, arg_table, data_ops):
+    def generateSchemeSubroutineCallOps(
+        self, subroutine_name, arg_table, data_ops, overrides=None
+    ):
         """Build the IR for a single scheme subroutine call guarded by errflg.
 
         Constructs the call op, copies out-arg results back to their storage
@@ -124,14 +135,29 @@ class GenerateSuiteSubroutine(RewritePattern):
         scheme expects 1-D), an UnrealizedConversionCastOp is inserted as a
         type annotation so xDSL verification passes.  The Fortran printer looks
         through these casts and emits the underlying variable name.
+
+        When *overrides* is non-empty a KeywordCallOp is emitted instead of a
+        plain func.CallOp; overridden arguments are omitted from the SSA
+        operand/result lists and carried as compile-time literals in the op.
         """
+        if overrides is None:
+            overrides = {}
+
+        # Only apply overrides whose names actually appear in this arg table;
+        # the same override dict may be shared across entry points (_run, _init,
+        # _finalize) and not every entry point has the same arguments.
+        arg_names_in_table = {arg.name for arg in arg_table.getFunctionArguments()}
+        overrides = {k: v for k, v in overrides.items() if k in arg_names_in_table}
+
         # Retrieve the callee's declared input/output types to detect mismatches.
         callee = self.meta_fn_sigs.get(subroutine_name)
         callee_in_types = list(callee.function_type.inputs) if callee else []
         callee_out_types = list(callee.function_type.outputs) if callee else []
 
         in_ssa = []
+        in_names = []
         out_types = []
+        out_names = []
         out_tracking = []
         cast_ops = []  # casts inserted before the call inside the if-body
         in_idx = 0
@@ -140,40 +166,57 @@ class GenerateSuiteSubroutine(RewritePattern):
         # Classify each argument as an input, output, or both (inout)
         for arg in arg_table.getFunctionArguments():
             intent = arg.getAttr("intent")
+            is_overridden = arg.name in overrides
             if intent == "in" or intent == "inout":
-                val = data_ops[arg.name]
-                actual_type = (
-                    val.type if isinstance(val, SSAValue) else val.results[0].type
-                )
-                expected_type = (
-                    callee_in_types[in_idx]
-                    if in_idx < len(callee_in_types)
-                    else actual_type
-                )
-                if actual_type != expected_type:
-                    cast = builtin.UnrealizedConversionCastOp(
-                        operands=[[val]], result_types=[[expected_type]]
-                    )
-                    cast_ops.append(cast)
-                    in_ssa.append(cast.results[0])
-                else:
-                    in_ssa.append(val)
-                in_idx += 1
-            if intent == "out" or intent == "inout":
-                val = data_ops[arg.name]
-                expected_out_type = (
-                    callee_out_types[out_idx]
-                    if out_idx < len(callee_out_types)
-                    else (
+                if not is_overridden:
+                    val = data_ops[arg.name]
+                    actual_type = (
                         val.type if isinstance(val, SSAValue) else val.results[0].type
                     )
-                )
-                out_types.append(expected_out_type)
-                out_tracking.append(val)
+                    expected_type = (
+                        callee_in_types[in_idx]
+                        if in_idx < len(callee_in_types)
+                        else actual_type
+                    )
+                    if actual_type != expected_type:
+                        cast = builtin.UnrealizedConversionCastOp(
+                            operands=[[val]], result_types=[[expected_type]]
+                        )
+                        cast_ops.append(cast)
+                        in_ssa.append(cast.results[0])
+                    else:
+                        in_ssa.append(val)
+                    in_names.append(arg.name)
+                in_idx += 1
+            if intent == "out" or intent == "inout":
+                if not is_overridden:
+                    val = data_ops[arg.name]
+                    expected_out_type = (
+                        callee_out_types[out_idx]
+                        if out_idx < len(callee_out_types)
+                        else (
+                            val.type
+                            if isinstance(val, SSAValue)
+                            else val.results[0].type
+                        )
+                    )
+                    out_types.append(expected_out_type)
+                    out_names.append(arg.name)
+                    out_tracking.append(val)
                 out_idx += 1
 
         assert len(out_types) == len(out_tracking)
-        call_op = func.CallOp(subroutine_name, in_ssa, out_types)
+        if overrides:
+            call_op = KeywordCallOp(
+                subroutine_name,
+                ArrayAttr([StringAttr(n) for n in in_names]),
+                ArrayAttr([StringAttr(n) for n in out_names]),
+                DictionaryAttr({k: StringAttr(v) for k, v in overrides.items()}),
+                in_ssa,
+                out_types,
+            )
+        else:
+            call_op = func.CallOp(subroutine_name, in_ssa, out_types)
 
         # Copy each output result back to its storage location.
         # If the result type doesn't match the destination, cast back first.
@@ -301,18 +344,21 @@ class GenerateSuiteSubroutine(RewritePattern):
             assert tgt_subroutine_postfix is not None
             generated_subroutine_posfix = tgt_subroutine_postfix
 
-        scheme_names = self.getSchemeNames(suite_description)
+        scheme_entries = self.getSchemeNames(suite_description)
         arg_tables = {}
+        scheme_overrides: dict[str, dict[str, str]] = {}
         all_args = {}
         if tgt_subroutine_postfix is not None:
             # Fetch the argument table for each scheme's target subroutine;
             # schemes that don't have this entry point (e.g. no _finalize) are skipped.
-            for scheme_name in scheme_names:
+            # First occurrence wins for duplicate scheme names.
+            for scheme_name, overrides in scheme_entries:
                 table = self.getArgumentTable(
                     scheme_name, scheme_name + tgt_subroutine_postfix
                 )
-                if table is not None:
+                if table is not None and scheme_name not in arg_tables:
                     arg_tables[scheme_name] = table
+                    scheme_overrides[scheme_name] = overrides
 
             # Collect unique args across all schemes, preserving first-seen order
             for scheme_name in arg_tables:
@@ -465,7 +511,10 @@ class GenerateSuiteSubroutine(RewritePattern):
                 full_name = scheme_name + tgt_subroutine_postfix
                 assert full_name in self.meta_fn_sigs
                 call_ops += self.generateSchemeSubroutineCallOps(
-                    full_name, arg_tables[scheme_name], data_ops
+                    full_name,
+                    arg_tables[scheme_name],
+                    data_ops,
+                    scheme_overrides.get(scheme_name, {}),
                 )
                 if full_name not in fn_sigs:
                     fn_sigs[full_name] = self.meta_fn_sigs[full_name]

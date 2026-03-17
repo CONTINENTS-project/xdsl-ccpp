@@ -25,6 +25,7 @@ from xdsl.utils.hints import isa
 from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp
 from xdsl_ccpp.dialects.ccpp_utils import DerivedType as CCPPDerivedType
 from xdsl_ccpp.dialects.ccpp_utils import HostVarRefOp as CCPPHostVarRefOp
+from xdsl_ccpp.dialects.ccpp_utils import KeywordCallOp as CCPPKeywordCallOp
 from xdsl_ccpp.dialects.ccpp_utils import KindDefOp as CCPPKindDefOp
 from xdsl_ccpp.dialects.ccpp_utils import RealKindType as CCPPRealKindType
 from xdsl_ccpp.dialects.ccpp_utils import SetStringOp as CCPPSetStringOp
@@ -402,6 +403,8 @@ class ftnPrintContext:
                     self._print_fn(name, bdy, ftyp)
             case func.CallOp(callee=tgt, arguments=args, res=results):
                 self._print_call(tgt, args, results)
+            case CCPPKeywordCallOp():
+                self._print_kw_call(op)
             case scf.IfOp(
                 cond=conditional, true_region=true_bdy, false_region=false_bdy
             ):
@@ -634,6 +637,49 @@ class ftnPrintContext:
 
         self.print(")", use_prefix=False)
 
+    def _print_kw_call(self, op: CCPPKeywordCallOp):
+        """Print a ccpp_utils.kw_call as a Fortran keyword-argument subroutine call.
+
+        Compile-time literal overrides are emitted first as ``name=literal``,
+        then SSA input operands as ``name=var_name``, then SSA output results
+        as ``name=dest_var``.  Inout arguments (present in both operand_names
+        and result_names) are deduplicated via a seen-names set.
+        """
+        self.print(f"call {op.callee.data}(", end="")
+        idx = 0
+        seen: set[str] = set()
+        for name, val_attr in op.overrides.data.items():
+            if idx > 0:
+                self.print(", ", end="", use_prefix=False)
+            self.print(f"{name}={val_attr.data}", end="", use_prefix=False)
+            seen.add(name)
+            idx += 1
+        for name_attr, arg in zip(op.operand_names.data, op.args):
+            name = name_attr.data
+            if name not in seen:
+                if idx > 0:
+                    self.print(", ", end="", use_prefix=False)
+                self.print(
+                    f"{name}={self._get_variable_name_for(arg)}",
+                    end="",
+                    use_prefix=False,
+                )
+                seen.add(name)
+                idx += 1
+        for name_attr, res in zip(op.result_names.data, op.res):
+            name = name_attr.data
+            if name not in seen:
+                if idx > 0:
+                    self.print(", ", end="", use_prefix=False)
+                self.print(
+                    f"{name}={self.get_call_result_var_ssa(res)}",
+                    end="",
+                    use_prefix=False,
+                )
+                seen.add(name)
+                idx += 1
+        self.print(")", use_prefix=False)
+
     def _print_if(
         self,
         conditional,
@@ -723,7 +769,9 @@ class ftnPrintContext:
 
         untracked_call_results: list[tuple[OpResult, str]] = []
         for nested_op in bdy.block.walk():
-            if not isa(nested_op, func.CallOp):
+            if not isa(nested_op, func.CallOp) and not isa(
+                nested_op, CCPPKeywordCallOp
+            ):
                 continue
             for res in nested_op.results:
                 has_copy = _has_copy_consumer(res)

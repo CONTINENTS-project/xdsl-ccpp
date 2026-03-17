@@ -1,4 +1,12 @@
-from xdsl.dialects.builtin import IntegerAttr, IntegerType, MemRefType, StringAttr, i1
+from xdsl.dialects.builtin import (
+    ArrayAttr,
+    DictionaryAttr,
+    IntegerAttr,
+    IntegerType,
+    MemRefType,
+    StringAttr,
+    i1,
+)
 from xdsl.dialects.llvm import LLVMArrayType
 from xdsl.ir import (
     Dialect,
@@ -19,6 +27,7 @@ from xdsl.irdl import (
     prop_def,
     result_def,
     var_operand_def,
+    var_result_def,
 )
 
 
@@ -270,6 +279,59 @@ class TrimOp(IRDLOperation):
         )
 
 
+@irdl_op_definition
+class KeywordCallOp(IRDLOperation):
+    """Fortran subroutine call with keyword (named) argument syntax.
+
+    Used when one or more arguments are overridden with compile-time literal
+    values.  All arguments — both SSA-sourced and literal-overridden — are
+    printed with ``name=value`` syntax::
+
+        call hello_scheme_run(var_a=92, ncol=ncol, lev=lev, errmsg=errmsg)
+
+    Properties:
+        callee:         The called subroutine name.
+        operand_names:  Scheme parameter names for each SSA operand, in order.
+        result_names:   Scheme parameter names for each SSA result, in order.
+        overrides:      Compile-time literal overrides: {arg_name → value_str}.
+
+    The printer deduplicates inout arguments (which appear in both operands
+    and results) using a seen-names set.
+    """
+
+    name = "ccpp_utils.kw_call"
+
+    callee = prop_def(StringAttr)
+    operand_names = prop_def(ArrayAttr)
+    result_names = prop_def(ArrayAttr)
+    overrides = prop_def(DictionaryAttr)
+
+    args = var_operand_def()
+    res = var_result_def()
+
+    def __init__(
+        self,
+        callee: str | StringAttr,
+        operand_names: ArrayAttr,
+        result_names: ArrayAttr,
+        overrides: DictionaryAttr,
+        args: list,
+        out_types: list,
+    ):
+        if isinstance(callee, str):
+            callee = StringAttr(callee)
+        super().__init__(
+            operands=[args],
+            properties={
+                "callee": callee,
+                "operand_names": operand_names,
+                "result_names": result_names,
+                "overrides": overrides,
+            },
+            result_types=[out_types],
+        )
+
+
 CCPPUtils = Dialect(
     "ccpp_utils",
     [
@@ -280,6 +342,7 @@ CCPPUtils = Dialect(
         ArraySectionOp,
         KindDefOp,
         SetStringOp,
+        KeywordCallOp,
     ],
     [RealKindType, DerivedType],
 )

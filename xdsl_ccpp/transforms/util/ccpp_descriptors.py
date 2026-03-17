@@ -174,8 +174,8 @@ class XMLSuiteBase:
 class XMLScheme(XMLSuiteBase):
     """Leaf node representing a single scheme within a group."""
 
-    def __init__(self, scheme_name):
-        super().__init__({"name": scheme_name})
+    def __init__(self, scheme_name, arg_overrides=None):
+        super().__init__({"name": scheme_name, "arg_overrides": arg_overrides or {}})
 
 
 class XMLGroup(XMLSuiteBase):
@@ -360,6 +360,10 @@ class BuildSchemeDescription(Visitor):
         """Build an `XMLScheme` leaf from one `ccpp.SchemeOp` node.
 
         Stores the result in ``self.current_scheme`` for the parent traversal
-        method to pick up.
+        method to pick up.  Any ``arg_overrides`` property on the op is
+        threaded through as a plain ``{name: literal_str}`` dict.
         """
-        self.current_scheme = XMLScheme(scheme_op.scheme_name.data)
+        overrides = {}
+        if scheme_op.arg_overrides is not None:
+            overrides = {k: v.data for k, v in scheme_op.arg_overrides.data.items()}
+        self.current_scheme = XMLScheme(scheme_op.scheme_name.data, overrides)

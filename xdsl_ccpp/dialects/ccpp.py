@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from enum import StrEnum, auto
 
 from xdsl.dialects.builtin import (
+    DictionaryAttr,
     IntAttr,
     StringAttr,
     UnitAttr,
@@ -105,13 +106,23 @@ class SchemeOp(IRDLOperation):
     name = "ccpp.scheme"
 
     scheme_name = prop_def(StringAttr)
+    # Compile-time keyword argument overrides: {arg_name → literal_value_str}.
+    # Present only when the Python frontend specifies per-call overrides.
+    arg_overrides = opt_prop_def(DictionaryAttr)
 
-    def __init__(self, scheme_name: str | StringAttr):
-
+    def __init__(
+        self,
+        scheme_name: str | StringAttr,
+        overrides: dict[str, str] | None = None,
+    ):
         if isa(scheme_name, str):
             scheme_name = StringAttr(scheme_name)
 
-        properties = {"scheme_name": scheme_name}
+        properties: dict = {"scheme_name": scheme_name}
+        if overrides:
+            properties["arg_overrides"] = DictionaryAttr(
+                {k: StringAttr(str(v)) for k, v in overrides.items()}
+            )
 
         super().__init__(properties=properties)
 
