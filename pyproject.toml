@@ -13,12 +13,17 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "ruff",
+    "filecheck",
+    "pytest",
 ]
 
 [project.scripts]
 ccpp_xdsl = "xdsl_ccpp.tools.ccpp_dsl:main"
 ccpp_prebuild = "xdsl_ccpp.tools.ccpp_prebuild:main"
 fir2meta = "xdsl_ccpp.tools.fir2meta:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py310"
