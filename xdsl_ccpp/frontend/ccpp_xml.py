@@ -1,4 +1,5 @@
 import argparse
+import os
 import xml.etree.ElementTree as ET
 from enum import Enum, StrEnum, auto
 
@@ -9,6 +10,7 @@ from xdsl_ccpp.dialects.ccpp import (
     ArgumentTableOp,
     GroupOp,
     SchemeOp,
+    SubcycleOp,
     SuiteOp,
     TablePropertiesOp,
 )
@@ -104,7 +106,10 @@ class CCPPTableProperties(CCPPItem):
         # Coerce raw string 'type' values into the CCPPType enum
         if key == "type" and isinstance(value, str):
             value = CCPPType(value)
-        super().setAttr(key, value, ["name", "type", "dependencies", "relative_path"])
+        # Silently ignore unrecognised keys (e.g. dependencies_path)
+        allowed_keys = ["name", "type", "dependencies", "relative_path", "module"]
+        if key in allowed_keys:
+            super().setAttr(key, value, allowed_keys)
 
 
 class CCPPArgumentTable(CCPPItem):
@@ -186,20 +191,35 @@ class XMLScheme(XMLSuiteBase):
         assert len(xml_node) == 0  # scheme elements must be leaf nodes
 
 
+class XMLSubcycle(XMLSuiteBase):
+    """Node for a ``<subcycle loop="N">`` element, whose schemes the suite repeats."""
+
+    def __init__(self, xml_node):
+        assert xml_node.tag == "subcycle"
+        super().__init__(xml_node)
+        self.loop = int(xml_node.attrib.get("loop", "1"))
+        for child in xml_node:
+            self.children.append(XMLScheme(child))
+
+
 class XMLGroup(XMLSuiteBase):
     """Intermediate node representing a named ``<group>`` within a suite.
 
     Parses all ``<scheme>`` children and stores them as `XMLScheme` nodes.
+    Schemes inside a ``<subcycle loop="N">`` element go into an `XMLSubcycle`.
     """
 
     def __init__(self, xml_node):
         assert xml_node.tag == "group"
         super().__init__(xml_node)
 
-        # Parse each child scheme element into an XMLScheme node
+        # Parse each child scheme element into an XMLScheme node; the schemes of a
+        # subcycle go into an XMLSubcycle
         for child in xml_node:
             if child.tag == "scheme":
                 self.children.append(XMLScheme(child))
+            elif child.tag == "subcycle":
+                self.children.append(XMLSubcycle(child))
 
 
 class XMLSuite(XMLSuiteBase):
@@ -344,6 +364,10 @@ class ccppXML:
             nonlocal current_table_properties, table_arg_tables
             if current_table_properties is None:
                 return
+            if current_table_properties.attrs.get("type") == "ddt":
+                # CCPP pairs each .meta file with the Fortran module of that name
+                stem = os.path.splitext(os.path.basename(filename))[0]
+                current_table_properties.setAttr("module", stem)
             cls = SchemeMetaData if isScheme else HostMetaData
             completed.append(cls(current_table_properties, table_arg_tables))
             current_table_properties = None
@@ -357,7 +381,8 @@ class ccppXML:
                 if not sline or sline.startswith("#"):
                     continue
 
-                if "[" in sline and "]" in sline:
+                # Attribute values can contain brackets, e.g. 'long_name = x [im]'
+                if sline.startswith("[") and "]" in sline:
                     # Strip brackets to get the section token
                     token = sline.translate(str.maketrans("", "", "[]"))
 
@@ -379,9 +404,9 @@ class ccppXML:
                         # Begin a new argument-table header block
                         parse_state = ccppXML.MetaParseState.ARG_TABLE
                         current_arg_table = CCPPArgumentTable()
-                    elif token[0] == " " or token[-1] == " ":
+                    elif current_arg_table is not None:
                         # Argument block — token is the variable name; spaces may appear
-                        # on one or both sides (e.g. '[ ncols]' or '[ temp_level ]')
+                        # around it (e.g. '[ ncols]' or '[ temp_level ]')
                         if current_arg is not None:
                             current_arg_table.setFunctionArgument(current_arg)
                         parse_state = ccppXML.MetaParseState.ARG
@@ -419,6 +444,29 @@ class ccppXML:
             table_arg_tables.append(current_arg_table)
         _flush_table_properties()
 
+        # The types of a file are in its module table when that has another name
+        modules = [
+            meta.table_properties.attrs["name"]
+            for meta in completed
+            if meta.table_properties.attrs.get("type") == "module"
+        ]
+        if len(modules) == 1:
+            for meta in completed:
+                if meta.table_properties.attrs.get("type") == "ddt":
+                    meta.table_properties.setAttr("module", modules[0])
+
+        # A file with a module table says which module its types are in; otherwise
+        # that is the module that has the name of the file
+        module_names = [
+            meta.table_properties.getAttr("name")
+            for meta in completed
+            if meta.table_properties.attrs.get("type") == "module"
+        ]
+        if module_names:
+            for meta in completed:
+                if meta.table_properties.attrs.get("type") == "ddt":
+                    meta.table_properties.setAttr("module", module_names[0])
+
         assert completed
         return completed
 
@@ -437,7 +485,14 @@ class ccppXML:
             schemes = []
             # Build a SchemeOp for each scheme in the group
             for scheme in grp:
-                schemes.append(SchemeOp(scheme.scheme_name))
+                if isinstance(scheme, XMLSubcycle):
+                    schemes.append(
+                        SubcycleOp(
+                            scheme.loop, [SchemeOp(s.scheme_name) for s in scheme]
+                        )
+                    )
+                else:
+                    schemes.append(SchemeOp(scheme.scheme_name))
             groups.append(GroupOp(grp.attributes["name"], schemes))
         return SuiteOp(
             suite.attributes["name"],
@@ -470,6 +525,7 @@ class ccppXML:
             meta.table_properties.getAttr("name"),
             str(meta.table_properties.getAttr("type")),
             tables,
+            meta.table_properties.attrs.get("module"),
         )
 
     def run(self):

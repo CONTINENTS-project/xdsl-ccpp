@@ -55,7 +55,7 @@ python3 examples/helloworld/helloworld_py.py | \
 | File | Description |
 |------|-------------|
 | `ccpp_kinds.F90` | Kind parameter definitions (`kind_phys` via ISO_FORTRAN_ENV) |
-| `hello_world_suite_cap.F90` | Suite cap: `_initialize`, `_physics`, `_finalize` subroutines |
+| `hello_world_suite_cap.F90` | Suite cap: `_initialize`, `_physics` (one per group), `_finalize` and timestep subroutines |
 | `hello_world_ccpp_cap.F90` | Host-facing cap: `ccpp_physics_initialize`, `ccpp_physics_run`, etc. |
 
 ## Python API features

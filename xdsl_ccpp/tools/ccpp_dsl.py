@@ -65,6 +65,18 @@ class ccppMain:
             "(e.g. 'HelloWorld'); derived from the suite name when not set",
         )
         parser.add_argument(
+            "--static-api",
+            action="store_true",
+            help="Generate the static API (ccpp_static_api.F90) that hosts such as "
+            "the CCPP Single Column Model call, instead of the host cap. The host "
+            "provides the horizontal loop bounds, so the caps take no arguments",
+        )
+        parser.add_argument(
+            "--static-api-name",
+            default="ccpp_static_api",
+            help="Name of the static API module (default: ccpp_static_api)",
+        )
+        parser.add_argument(
             "-t",
             "--tempdir",
             default="tmp",
@@ -279,12 +291,18 @@ class ccppMain:
 
     def run_opt(self, tmp_dir, mlir_in):
         ftn_out = os.path.join(tmp_dir, "ccpp.ftn")
+        suite_cap_pass = "generate-suite-cap"
         ccpp_cap_pass = "generate-ccpp-cap"
         if self.options_db.get("host_name"):
             ccpp_cap_pass += f"{{host_name={self.options_db['host_name']}}}"
+        if self.options_db.get("static_api"):
+            suite_cap_pass += "{static_api=true}"
+            ccpp_cap_pass = (
+                f"generate-static-api{{api_name={self.options_db['static_api_name']}}}"
+            )
         cmd = (
             f'python3 -m xdsl_ccpp.tools.ccpp_opt "{mlir_in}"'
-            f" -p generate-meta-cap,generate-meta-kinds,generate-suite-cap,{ccpp_cap_pass},generate-kinds,strip-ccpp"
+            f" -p generate-meta-cap,generate-meta-kinds,{suite_cap_pass},{ccpp_cap_pass},generate-kinds,strip-ccpp"
             f' -t ftn > "{ftn_out}"'
         )
         self.print_verbose_message(
@@ -301,7 +319,9 @@ class ccppMain:
         The printer emits sections separated by '// -----', each preceded by a
         '// FILE: <name>.F90' marker.  This method writes each section as a
         separate file in out_dir, or prints to stdout when --stdout is set.
+        Returns the names of the files.
         """
+        filenames = []
         with open(ftn_file) as f:
             content = f.read()
 
@@ -314,18 +334,29 @@ class ccppMain:
             if not lines[0].startswith("// FILE:"):
                 continue
             filename = lines[0][len("// FILE:") :].strip()
+            filenames.append(filename)
             body = "\n".join(lines[1:]).lstrip("\n") + "\n"
 
             if self.options_db["stdout"]:
                 print(body)
             else:
                 out_path = os.path.join(out_dir, filename)
+                # Leave a file alone when it would not change, so that a build
+                # does not compile it again
+                if os.path.isfile(out_path):
+                    with open(out_path) as existing:
+                        if existing.read() == body:
+                            self.print_verbose_message(
+                                f"  -> Unchanged '{out_path}'",
+                            )
+                            continue
                 with open(out_path, "w") as out_f:
                     out_f.write(body)
                 self.print_verbose_message(
                     f"  -> Written '{out_path}'",
                     f"  -> Written '{out_path}' ({len(body)} bytes)",
                 )
+        return filenames
 
     def run(self):
         parser = self.initialise_argument_parser()

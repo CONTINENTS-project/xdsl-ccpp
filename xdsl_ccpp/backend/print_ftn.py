@@ -19,21 +19,42 @@ from xdsl.dialects.builtin import (
     ModuleOp,
     StringAttr,
 )
-from xdsl.ir import Attribute, Block, Operation, OpResult, Region, SSAValue
+from xdsl.ir import (
+    Attribute,
+    Block,
+    BlockArgument,
+    Operation,
+    OpResult,
+    Region,
+    SSAValue,
+)
 from xdsl.utils.hints import isa
 
+from xdsl_ccpp.backend import print_constituents
+from xdsl_ccpp.dialects.ccpp_utils import AllocateOp as CCPPAllocateOp
 from xdsl_ccpp.dialects.ccpp_utils import ArraySectionOp as CCPPArraySectionOp
+from xdsl_ccpp.dialects.ccpp_utils import DeallocateOp as CCPPDeallocateOp
 from xdsl_ccpp.dialects.ccpp_utils import DerivedType as CCPPDerivedType
+from xdsl_ccpp.dialects.ccpp_utils import FortranExprOp as CCPPFortranExprOp
+from xdsl_ccpp.dialects.ccpp_utils import HostConstituentsOp as CCPPHostConstituentsOp
 from xdsl_ccpp.dialects.ccpp_utils import HostVarRefOp as CCPPHostVarRefOp
 from xdsl_ccpp.dialects.ccpp_utils import KeywordCallOp as CCPPKeywordCallOp
 from xdsl_ccpp.dialects.ccpp_utils import KindDefOp as CCPPKindDefOp
+from xdsl_ccpp.dialects.ccpp_utils import PackConstituentsOp as CCPPPackConstituentsOp
+from xdsl_ccpp.dialects.ccpp_utils import PointerAssociateOp as CCPPPointerAssociateOp
+from xdsl_ccpp.dialects.ccpp_utils import PointerDeclOp as CCPPPointerDeclOp
+from xdsl_ccpp.dialects.ccpp_utils import PointerNullifyOp as CCPPPointerNullifyOp
 from xdsl_ccpp.dialects.ccpp_utils import RealKindType as CCPPRealKindType
 from xdsl_ccpp.dialects.ccpp_utils import SetStringOp as CCPPSetStringOp
 from xdsl_ccpp.dialects.ccpp_utils import StrCmpOp as CCPPStrCmpOp
+from xdsl_ccpp.dialects.ccpp_utils import SuiteConstituentsOp as CCPPSuiteConstituentsOp
+from xdsl_ccpp.dialects.ccpp_utils import SuiteVariablesFnOp as CCPPSuiteVariablesFnOp
+from xdsl_ccpp.dialects.ccpp_utils import SuiteVarOp as CCPPSuiteVarOp
 from xdsl_ccpp.dialects.ccpp_utils import TrimOp as CCPPTrimOp
 from xdsl_ccpp.dialects.ccpp_utils import WriteErrMsgOp as CCPPWriteErrMsgOp
 
 _MAX_LINE_LEN = 99
+_OPERATORS = (" .or. ", " .and. ")
 
 
 @dataclass
@@ -207,10 +228,12 @@ class ftnPrintContext:
                 return "integer"
             case MemRefType(
                 element_type=IntegerType(width=IntAttr(data=8)), shape=shape
-            ) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:  # noqa: E501
-                # A 1-D dynamic i8 memref is an assumed-length Fortran character
-                # argument — declared as character(len=*), not character(:).
-                return "character(len=*)"
+            ) if len(shape) >= 1:
+                # The leading dimension of an i8 memref is the character length,
+                # with any array dimensions after it. A dynamic length is an
+                # assumed-length argument, declared as character(len=*).
+                length = next(iter(shape)).data
+                return f"character(len={'*' if length == DYNAMIC_INDEX else length})"
             case MemRefType(element_type=Attribute() as elem_t, shape=shape):
                 if any(dim.data == DYNAMIC_INDEX for dim in shape):
                     # Dynamic-dimension array: return only the base type string.
@@ -243,9 +266,13 @@ class ftnPrintContext:
         match type_attr:
             case MemRefType(
                 element_type=IntegerType(width=IntAttr(data=8)), shape=shape
-            ) if len(shape) == 1 and next(iter(shape)).data == DYNAMIC_INDEX:  # noqa: E501
-                # character(len=*) uses len= notation — no dimension suffix needed
-                return ""
+            ):
+                # The character length is part of the type, so only the array
+                # dimensions after it become a suffix
+                rank = len(shape) - 1
+                return (
+                    "(" + ", ".join(":" for _ in range(rank)) + ")" if rank > 0 else ""
+                )
             case MemRefType(shape=shape) if any(
                 dim.data == DYNAMIC_INDEX for dim in shape
             ):
@@ -344,6 +371,8 @@ class ftnPrintContext:
             case CCPPTrimOp():
                 lhs_name = self._get_variable_name_for(op.lhs)
                 self.print(f"trim({lhs_name})", end="", use_prefix=False)
+            case CCPPFortranExprOp():
+                self.print(op.text.data, end="", use_prefix=False)
             case CCPPStrCmpOp():
                 if op.literal is not None:
                     self.print_expr(op.lhs.owner)
@@ -372,6 +401,9 @@ class ftnPrintContext:
         global declarations, yield) are skipped with a pass.
         """
         match op:
+            case builtin.ModuleOp(attributes={"ftn_source": StringAttr(data=text)}):
+                # A module written out in full, such as a static API
+                print(text.rstrip("\n"), file=self.output)
             case builtin.ModuleOp(sym_name=name, body=bdy):
                 self._print_module(name, bdy)
             case memref.AllocaOp():
@@ -401,6 +433,8 @@ class ftnPrintContext:
                 # Skip external declarations; only print subroutine definitions
                 if not op.is_declaration:
                     self._print_fn(name, bdy, ftyp)
+            case func.CallOp() if "ftn_arg_names" in op.attributes:
+                self._print_named_call(op)
             case func.CallOp(callee=tgt, arguments=args, res=results):
                 self._print_call(tgt, args, results)
             case CCPPKeywordCallOp():
@@ -409,6 +443,41 @@ class ftnPrintContext:
                 cond=conditional, true_region=true_bdy, false_region=false_bdy
             ):
                 self._print_if(conditional, true_bdy, false_bdy)
+            case scf.ForOp():
+                self._print_for(op)
+            case CCPPFortranExprOp():
+                self.variables[op.res] = op.text.data
+            case CCPPSuiteVarOp():
+                pass  # Module variables are declared in _print_module preamble
+            case CCPPAllocateOp():
+                name = self._get_variable_name_for(op.var)
+                bounds = ", ".join(
+                    f"{self._value_to_expr_str(lower)}:{self._value_to_expr_str(upper)}"
+                    for lower, upper in zip(op.lowers, op.uppers)
+                )
+                self.print(f"if (.not. allocated({name})) then")
+                self.print(f"  allocate({name}({bounds}))")
+                if op.initial_value is not None:
+                    self.print(f"  {name} = {op.initial_value.data}")
+                self.print("end if")
+            case CCPPDeallocateOp():
+                name = self._get_variable_name_for(op.var)
+                self.print(f"if (allocated({name})) deallocate({name})")
+            case CCPPSuiteVariablesFnOp():
+                self._print_suite_variables_fn(op)
+            case CCPPPointerDeclOp():
+                pass  # Declared with the other locals in _print_fn
+            case CCPPPointerAssociateOp():
+                pointer = self._get_variable_name_for(op.pointer)
+                self.print(f"{pointer} => {self._value_to_expr_str(op.target)}")
+            case CCPPPointerNullifyOp():
+                self.print(f"nullify({self._get_variable_name_for(op.pointer)})")
+            case CCPPSuiteConstituentsOp():
+                self._print_lines(print_constituents.suite_routines(op))
+            case CCPPHostConstituentsOp():
+                self._print_lines(print_constituents.host_routines(op))
+            case CCPPPackConstituentsOp():
+                self._print_lines(print_constituents.pack_lines(op))
             case memref.AllocOp():
                 pass  # Heap allocations are emitted via the StoreOp that uses the result
             case CCPPKindDefOp():
@@ -452,7 +521,13 @@ class ftnPrintContext:
                         self.print(f"{arr_name}[{idx_args}] = ", end="")
                     else:
                         self.print(f"{arr_name} = ", end="")
-                    self.print_expr(val.owner)
+                    if isinstance(val, BlockArgument):
+                        # e.g. the index of a loop
+                        self.print(
+                            self._get_variable_name_for(val), end="", use_prefix=False
+                        )
+                    else:
+                        self.print_expr(val.owner)
                     self.print("")
             case CCPPHostVarRefOp():
                 # Register the host variable name for the result — no Fortran emitted
@@ -470,7 +545,10 @@ class ftnPrintContext:
                 for lower, upper in zip(op.lowers, op.uppers):
                     lower_str = self._value_to_expr_str(lower)
                     upper_str = self._value_to_expr_str(upper)
-                    parts.append(f"{lower_str}:{upper_str}")
+                    if lower is upper:
+                        parts.append(lower_str)
+                    else:
+                        parts.append(f"{lower_str}:{upper_str}")
                 self.variables[op.res] = f"{source_name}({', '.join(parts)})"
             case builtin.UnrealizedConversionCastOp():
                 # Type annotation cast — transparent to Fortran; map each result
@@ -509,8 +587,12 @@ class ftnPrintContext:
 
         self.print(f"module {module_name.data}")
 
-        # The ccpp_kinds module must not use itself (circular dependency)
-        if not is_kinds_module:
+        # The ccpp_kinds module must not use itself (circular dependency), and is
+        # not generated when the host defines all of the kinds
+        if (
+            not is_kinds_module
+            and "ftn_no_ccpp_kinds" not in body.parent_op().attributes
+        ):
             self.print("\nuse ccpp_kinds", prefix="  ")
 
         # For the ccpp_kinds module, emit ISO_FORTRAN_ENV renames:
@@ -537,8 +619,23 @@ class ftnPrintContext:
             elif isa(op, llvm.GlobalOp) and "module" in op.attributes:
                 mod = op.attributes["module"].data
                 use_map.setdefault(mod, []).append(op.sym_name.data)
+        # 3. Types and procedures that the constituent routines need.
+        for op in body.ops:
+            if isa(op, CCPPSuiteConstituentsOp):
+                uses = print_constituents.suite_uses(op)
+            elif isa(op, CCPPHostConstituentsOp):
+                uses = print_constituents.host_uses(op)
+            else:
+                continue
+            for mod, name in uses:
+                use_map.setdefault(mod, []).append(name)
+        # 4. Derived types used by declarations in this module.
+        module_op = body.parent_op()
+        if "ftn_type_uses" in module_op.attributes:
+            for type_name, mod in module_op.attributes["ftn_type_uses"].data.items():
+                use_map.setdefault(mod.data, []).append(type_name)
         for mod, procs in sorted(use_map.items()):
-            for proc in sorted(procs):
+            for proc in sorted(set(procs)):
                 self.print(f"use {mod}, only: {proc}", prefix="  ")
 
         self.print("\nimplicit none", prefix="  ")
@@ -575,6 +672,27 @@ class ftnPrintContext:
                         f"character(len={char_len}) :: {name} = '{val}'", prefix="  "
                     )
 
+        # Emit the module variables that hold suite data
+        for op in body.ops:
+            if isa(op, CCPPSuiteVarOp):
+                type_str = self.mlir_type_to_ftn_type(op.var_type)
+                dim_suffix = self._ftn_dim_suffix(op.var_type)
+                if dim_suffix:
+                    type_str += ", allocatable"
+                initial = ""
+                if op.initial_value is not None and not dim_suffix:
+                    initial = f" = {op.initial_value.data}"
+                self.print(
+                    f"{type_str} :: {op.var_name.data}{dim_suffix}{initial}",
+                    prefix="  ",
+                )
+
+        for op in body.ops:
+            if isa(op, CCPPSuiteConstituentsOp):
+                self._print_lines(print_constituents.suite_declarations(op), "  ")
+            elif isa(op, CCPPHostConstituentsOp):
+                self._print_lines(print_constituents.host_declarations(op), "  ")
+
         # Emit one public :: line per subroutine definition that is marked public.
         public_procs = [
             op.sym_name.data
@@ -586,12 +704,16 @@ class ftnPrintContext:
                 and op.sym_visibility.data == "public"
             )
         ]
+        if any(isa(op, CCPPSuiteVariablesFnOp) for op in body.ops):
+            public_procs.append("ccpp_physics_suite_variables")
         for proc in public_procs:
             self.print(f"public :: {proc}", prefix="  ")
 
         # Only emit CONTAINS when there are subroutine definitions to print
         has_func_defs = any(
-            isa(op, func.FuncOp) and not op.is_declaration for op in body.ops
+            (isa(op, func.FuncOp) and not op.is_declaration)
+            or isinstance(op, (CCPPSuiteConstituentsOp, CCPPHostConstituentsOp))
+            for op in body.ops
         )
         if has_func_defs:
             self.print("\nCONTAINS")
@@ -612,8 +734,24 @@ class ftnPrintContext:
         for use in res_ssa.uses:
             if isa(use.operation, memref.CopyOp):
                 return self._get_variable_name_for(use.operation.destination)
+            if isa(use.operation, builtin.UnrealizedConversionCastOp):
+                return self.get_call_result_var_ssa(use.operation.results[0])
         # No CopyOp — must have been pre-registered as an anonymous local
         return self.variables.get(res_ssa)
+
+    def _print_named_call(self, op: func.CallOp):
+        """Print a func.CallOp whose dummy argument names are known.
+
+        An inout argument is both an operand and a result, and is printed once.
+        """
+        actuals = {}
+        for name, arg in zip(op.attributes["ftn_arg_names"].data, op.arguments):
+            actuals[name.data] = self._get_variable_name_for(arg)
+        for name, res in zip(op.attributes["ftn_result_names"].data, op.res):
+            if name.data not in actuals:
+                actuals[name.data] = self.get_call_result_var_ssa(res)
+        args_str = ", ".join(f"{name}={val}" for name, val in actuals.items())
+        self.print(f"call {op.callee.string_value()}({args_str})")
 
     def _print_call(self, tgt, args, results):
         """Print a func.CallOp as a Fortran subroutine call statement.
@@ -701,6 +839,88 @@ class ftnPrintContext:
 
         self.print("end if")
 
+    def _print_for(self, op: scf.ForOp):
+        """Print an scf.ForOp as a Fortran do loop."""
+        index = op.body.block.args[0]
+        name = self._get_variable_name_for(index)
+        lower = self._value_to_expr_str(op.lb)
+        upper = self._value_to_expr_str(op.ub)
+        self.print(f"do {name} = {lower}, {upper}")
+        with self.descend() as inner:
+            inner.print_block(op.body.block)
+        self.print("end do")
+
+    def _print_lines(self, lines: list[str], prefix: str = ""):
+        """Print lines of Fortran that were generated elsewhere."""
+        for line in lines:
+            self.print(line, prefix=prefix)
+
+    def _print_suite_variables_fn(self, op: CCPPSuiteVariablesFnOp):
+        """Print ccpp_physics_suite_variables, listing what each suite needs."""
+        lines = [
+            "subroutine ccpp_physics_suite_variables(suite_name, variable_list, "
+            "errmsg, errflg, input_vars, output_vars, struct_elements)",
+            "  character(len=*), intent(in) :: suite_name",
+            "  character(len=*), allocatable, intent(out) :: variable_list(:)",
+            "  character(len=512), intent(out) :: errmsg",
+            "  integer, intent(out) :: errflg",
+            "  logical, optional, intent(in) :: input_vars",
+            "  logical, optional, intent(in) :: output_vars",
+            "  logical, optional, intent(in) :: struct_elements",
+            "  logical :: use_inputs, use_outputs",
+            "  integer :: index",
+            "",
+            "  errflg = 0",
+            "  errmsg = ''",
+            "  use_inputs = .true.",
+            "  if (present(input_vars)) use_inputs = input_vars",
+            "  use_outputs = .true.",
+            "  if (present(output_vars)) use_outputs = output_vars",
+        ]
+        keyword = "if"
+        for suite_name, lists in op.variables.data.items():
+            inputs, outputs = ([name.data for name in names] for names in lists)
+            both = [name for name in inputs if name in outputs]
+            only_inputs = [name for name in inputs if name not in outputs]
+            only_outputs = [name for name in outputs if name not in inputs]
+            all_names = len(both) + len(only_inputs) + len(only_outputs)
+            lines += [
+                f"  {keyword} (trim(suite_name) == '{suite_name}') then",
+                "    if (use_inputs .and. use_outputs) then",
+                f"      allocate(variable_list({all_names}))",
+                "    else if (use_inputs) then",
+                f"      allocate(variable_list({len(inputs)}))",
+                "    else if (use_outputs) then",
+                f"      allocate(variable_list({len(outputs)}))",
+                "    else",
+                "      allocate(variable_list(0))",
+                "    end if",
+                "    index = 0",
+            ]
+            for condition, names in (
+                ("use_inputs .or. use_outputs", both),
+                ("use_inputs", only_inputs),
+                ("use_outputs", only_outputs),
+            ):
+                lines.append(f"    if ({condition}) then")
+                for name in names:
+                    lines += [
+                        "      index = index + 1",
+                        f"      variable_list(index) = '{name}'",
+                    ]
+                lines.append("    end if")
+            keyword = "else if"
+        lines += [
+            "  else",
+            "    write(errmsg, '(3a)') 'No suite named ', trim(suite_name), ' found'",
+            "    errflg = 1",
+            "  end if",
+            "end subroutine ccpp_physics_suite_variables",
+        ]
+        self.print("")
+        for line in lines:
+            self.print(line)
+
     def _print_fn(
         self,
         fn_name: StringAttr,
@@ -773,15 +993,34 @@ class ftnPrintContext:
                 nested_op, CCPPKeywordCallOp
             ):
                 continue
+            inout_results = set()
+            if "ftn_arg_names" in nested_op.attributes:
+                # A result that is also an operand is the same actual argument
+                arg_names = nested_op.attributes["ftn_arg_names"].data
+                result_names = nested_op.attributes["ftn_result_names"].data
+                inout_results = {
+                    res
+                    for res, name in zip(nested_op.results, result_names)
+                    if name in arg_names
+                }
             for res in nested_op.results:
                 has_copy = _has_copy_consumer(res)
-                if not has_copy:
+                if not has_copy and res not in inout_results:
                     hint = (
                         res.name_hint
                         if res.name_hint
-                        else f"_tmp_{len(untracked_call_results)}"
+                        else f"ccpp_tmp_{len(untracked_call_results)}"
                     )
                     untracked_call_results.append((res, hint))
+
+        # Declare the index of each loop
+        loop_indices = list(
+            dict.fromkeys(
+                nested_op.body.block.args[0].name_hint
+                for nested_op in bdy.block.walk()
+                if isa(nested_op, scf.ForOp)
+            )
+        )
 
         args_str = ", ".join(input_names + output_names)
         start_signature = f"\nsubroutine {fn_name.data}({args_str})"
@@ -801,12 +1040,27 @@ class ftnPrintContext:
             # provides the buffer and the scheme may write to it in-place.
             # Exception: memref<memref<?xi8>> is an allocatable character array
             # passed intent(out) — the callee allocates and fills it.
-            for arg, arg_name in zip(bdy.block.args, input_names):
+            fn_attrs = bdy.parent_op().attributes
+            arg_intents = (
+                [intent.data for intent in fn_attrs["ftn_arg_intents"]]
+                if "ftn_arg_intents" in fn_attrs
+                else None
+            )
+            allocatable_args = (
+                {name.data for name in fn_attrs["ftn_allocatable_args"]}
+                if "ftn_allocatable_args" in fn_attrs
+                else set()
+            )
+            for idx, (arg, arg_name) in enumerate(zip(bdy.block.args, input_names)):
                 type_str = inner.mlir_type_to_ftn_type(arg.type)
                 dim_suffix = inner._ftn_dim_suffix(arg.type)
                 if ftnPrintContext._is_allocatable_char(arg.type):
                     type_str = type_str + ", allocatable"
                     intent = "out"
+                elif arg_intents is not None:
+                    intent = arg_intents[idx]
+                    if arg_name in allocatable_args:
+                        type_str = type_str + ", allocatable"
                 elif dim_suffix:
                     intent = "inout"
                 elif arg in inout_block_args:
@@ -831,6 +1085,26 @@ class ftnPrintContext:
                 inner.variables[alloca_op.memref] = var_name
                 type_str = inner.mlir_type_to_ftn_type(alloca_op.memref.type)
                 inner.print(f"{type_str} :: {var_name}")
+
+            # Declare local pointers, which are disassociated until a condition holds
+            for pointer_op in bdy.block.ops:
+                if not isa(pointer_op, CCPPPointerDeclOp):
+                    continue
+                pointer = pointer_op.res
+                var_name = pointer.name_hint or f"ccpp_ptr_{id(pointer_op)}"
+                inner.variables[pointer] = var_name
+                type_str = inner.mlir_type_to_ftn_type(pointer.type)
+                # A pointer to a string takes the length of its target
+                type_str = type_str.replace("(len=*)", "(len=:)")
+                dim_suffix = inner._ftn_dim_suffix(pointer.type)
+                inner.print(f"{type_str}, pointer :: {var_name}{dim_suffix} => null()")
+
+            for index_name in loop_indices:
+                inner.print(f"integer :: {index_name}")
+
+            if "ftn_local_decls" in fn_attrs:
+                for decl in fn_attrs["ftn_local_decls"]:
+                    inner.print(decl.data)
 
             # Declare anonymous locals for call results that have no CopyOp consumer
             for res, var_name in untracked_call_results:
@@ -906,6 +1180,13 @@ class ftnPrintContext:
             return
         # Search for the last comma that leaves room for ' &' within the limit
         split_pos = line.rfind(",", 0, _MAX_LINE_LEN - 2)
+        if split_pos == -1:
+            # A long first argument or condition: split after the next comma, or
+            # before the last logical operator that fits
+            split_pos = line.find(",", _MAX_LINE_LEN - 2)
+        if split_pos == -1:
+            operators = [line.rfind(op, 0, _MAX_LINE_LEN - 2) for op in _OPERATORS]
+            split_pos = max(operators) - 1 if max(operators) > 0 else -1
         if split_pos == -1:
             # No valid split point — emit as-is rather than produce invalid Fortran
             print(line, file=self.output)

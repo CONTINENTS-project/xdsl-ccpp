@@ -1,4 +1,4 @@
-from xdsl.dialects import builtin, memref
+from xdsl.dialects import builtin, func, memref
 from xdsl.dialects.builtin import DYNAMIC_INDEX
 
 from xdsl_ccpp.dialects.ccpp_utils import DerivedType, RealKindType
@@ -43,6 +43,14 @@ class TypeConversions:
         "character": builtin.i8,
         "integer": builtin.i32,
         "real": builtin.f64,
+        "logical": builtin.i1,
+    }
+
+    # Derived types that the CCPP framework provides, with no metadata of their own
+    FRAMEWORK_DDTS = {
+        "ccpp_constituent_properties_t": "ccpp_constituent_prop_mod",
+        "ccpp_constituent_prop_ptr_t": "ccpp_constituent_prop_mod",
+        "ccpp_model_constituents_t": "ccpp_constituent_prop_mod",
     }
 
     @classmethod
@@ -80,11 +88,49 @@ class TypeConversions:
             # and have no effect on the memref shape.
             len_val = kind.split("=")[1]
             shape = [DYNAMIC_INDEX if len_val == "*" else int(len_val)]
+            # For a character array the leading memref dimension is the string
+            # length and the array dimensions follow it.
+            shape += [DYNAMIC_INDEX] * dimensions
+        elif text_type == "character" and dimensions > 0:
+            shape = [1] + [DYNAMIC_INDEX] * dimensions
         elif dimensions > 0:
             # Each CCPP dimension maps to a dynamic-size axis in the memref;
             # the actual extent is provided by the host at runtime
             shape = [DYNAMIC_INDEX] * dimensions
         return memref.MemRefType(base_type, shape)
+
+    @classmethod
+    def convert_arg(cls, arg, dimensions=None):
+        """Convert a metadata argument to its type.
+
+        *dimensions* overrides the rank, for a selection from a larger array.
+        """
+        if dimensions is None:
+            dimensions = arg.getAttr("dimensions") if arg.hasAttr("dimensions") else 0
+        kind = arg.getAttr("kind") if arg.hasAttr("kind") else None
+        return cls.convert(arg.getAttr("type"), kind, dimensions)
+
+    @classmethod
+    def derived_type_uses(cls, module_op, meta_data):
+        """Return ``{ddt_name: fortran_module}`` for the DDTs used in *module_op*.
+
+        Only DDTs whose defining module is known from the metadata are included.
+        """
+        seen = set()
+        for op in module_op.walk():
+            types = [res.type for res in op.results]
+            if isinstance(op, func.FuncOp):
+                types += [*op.function_type.inputs, *op.function_type.outputs]
+            for type_attr in types:
+                if isinstance(type_attr, memref.MemRefType):
+                    type_attr = type_attr.element_type
+                if isinstance(type_attr, DerivedType):
+                    seen.add(type_attr.type_name.data)
+        modules = dict(cls.FRAMEWORK_DDTS)
+        for name, props in meta_data.items():
+            if props.hasAttr("module"):
+                modules[name] = props.getAttr("module")
+        return {name: modules[name] for name in sorted(seen) if name in modules}
 
     @classmethod
     def getBaseType(cls, text_type):

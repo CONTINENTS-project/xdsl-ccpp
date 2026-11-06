@@ -59,6 +59,23 @@ class CCPPItem:
         return self.attrs
 
 
+# Names that CCPP accepts for each scheme entry point
+ENTRY_POINT_ALIASES = {
+    "_init": ("_init", "_initialize"),
+    "_finalize": ("_finalize", "_final"),
+    "_timestep_init": ("_timestep_init", "_timestep_initialize"),
+    "_timestep_final": ("_timestep_final", "_timestep_finalize"),
+}
+
+
+def find_entry_point(table_properties, scheme_name, postfix):
+    """Return the argument table name of a scheme entry point, or None if absent."""
+    for alias in ENTRY_POINT_ALIASES.get(postfix, (postfix,)):
+        if scheme_name + alias in table_properties.arg_tables:
+            return scheme_name + alias
+    return None
+
+
 class CCPPTableProperties(CCPPItem):
     """Descriptor for a ``[ccpp-table-properties]`` metadata block.
 
@@ -82,7 +99,9 @@ class CCPPTableProperties(CCPPItem):
         # Coerce raw string 'type' values into the CCPPType enum
         if key == "type" and isinstance(value, str):
             value = CCPPType(value)
-        super().setAttr(key, value, ["name", "type", "dependencies", "relative_path"])
+        super().setAttr(
+            key, value, ["name", "type", "dependencies", "relative_path", "module"]
+        )
 
     def setArgTable(self, k, v):
         """Register an argument table under the given key."""
@@ -171,11 +190,22 @@ class XMLSuiteBase:
         self.children.append(child)
 
 
-class XMLScheme(XMLSuiteBase):
-    """Leaf node representing a single scheme within a group."""
+class Subcycle:
+    """The schemes of one ``subcycle`` element share one of these."""
 
-    def __init__(self, scheme_name, arg_overrides=None):
+    def __init__(self, loop):
+        self.loop = loop
+
+
+class XMLScheme(XMLSuiteBase):
+    """Leaf node representing a single scheme within a group.
+
+    ``subcycle`` is the `Subcycle` that the scheme repeats in, if any.
+    """
+
+    def __init__(self, scheme_name, arg_overrides=None, subcycle=None):
         super().__init__({"name": scheme_name, "arg_overrides": arg_overrides or {}})
+        self.subcycle = subcycle
 
 
 class XMLGroup(XMLSuiteBase):
@@ -240,6 +270,8 @@ class BuildMetaDataDescriptions(Visitor):
         ccpp_prop = CCPPTableProperties(arg_tables)
         ccpp_prop.setAttr("name", properties_op.table_name.data)
         ccpp_prop.setAttr("type", properties_op.table_type.data)
+        if properties_op.module is not None:
+            ccpp_prop.setAttr("module", properties_op.module.data)
         self.meta_data[ccpp_prop.getAttr("name")] = ccpp_prop
 
     def traverse_argument_table_op(self, arg_table_op: ccpp.ArgumentTableOp):
@@ -279,7 +311,16 @@ class BuildMetaDataDescriptions(Visitor):
         arg = CCPPArgument(arg_op.arg_name.data)
 
         # Copy well-known string properties from the IR op into the descriptor
-        known_props = ["standard_name", "long_name", "kind", "intent", "units", "type"]
+        known_props = [
+            "standard_name",
+            "long_name",
+            "kind",
+            "intent",
+            "units",
+            "type",
+            "active",
+            "default_value",
+        ]
         for kp in known_props:
             if kp in arg_op.properties:
                 arg.setAttr(kp, arg_op.properties[kp].data)
@@ -295,6 +336,15 @@ class BuildMetaDataDescriptions(Visitor):
         # 'optional' is a flag attribute — store as a boolean rather than a string
         if "optional" in arg_op.properties:
             arg.setAttr("optional", True)
+        if "allocatable" in arg_op.properties:
+            arg.setAttr("allocatable", True)
+        if "protected" in arg_op.properties:
+            arg.setAttr("protected", True)
+        for flag in ("advected", "constituent"):
+            if flag in arg_op.properties:
+                arg.setAttr(flag, True)
+        if "molar_mass" in arg_op.properties:
+            arg.setAttr("molar_mass", arg_op.properties["molar_mass"].data)
 
         # Surface the completed argument to the parent traversal via self.arg_token
         self.arg_token = arg
@@ -349,12 +399,21 @@ class BuildSchemeDescription(Visitor):
         self.current_group = XMLGroup(group_op.group_name.data)
 
         # Visit each child SchemeOp; after each visit self.current_scheme holds
-        # the XMLScheme for that scheme
+        # the XMLScheme for that scheme.  The schemes of a subcycle join the group
+        # in order, and know the subcycle.
         for op in group_op.body.ops:
-            self.traverse(op)
-            assert self.current_scheme is not None
-            self.current_group.addChild(self.current_scheme)
-            self.current_scheme = None  # reset for the next sibling
+            subcycle = None
+            if isinstance(op, ccpp.SubcycleOp):
+                subcycle = Subcycle(op.loop.data)
+                scheme_ops = list(op.body.ops)
+            else:
+                scheme_ops = [op]
+            for scheme_op in scheme_ops:
+                self.traverse(scheme_op)
+                assert self.current_scheme is not None
+                self.current_scheme.subcycle = subcycle
+                self.current_group.addChild(self.current_scheme)
+                self.current_scheme = None  # reset for the next sibling
 
     def traverse_scheme_op(self, scheme_op: ccpp.SchemeOp):
         """Build an `XMLScheme` leaf from one `ccpp.SchemeOp` node.

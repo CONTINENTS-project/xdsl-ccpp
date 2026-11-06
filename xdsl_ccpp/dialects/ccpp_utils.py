@@ -188,11 +188,13 @@ class ArraySectionOp(IRDLOperation):
     """Represent a Fortran array section: source(lower0:upper0, lower1:upper1, ...).
 
     Used purely for Fortran code generation — no transformation semantics.
-    The result type matches the source type.  The Fortran printer resolves the
-    result to 'source_name(lower0:upper0, lower1:upper1)' so that downstream
-    call ops emit the correct Fortran array-section notation.
+    The Fortran printer resolves the result to
+    'source_name(lower0:upper0, lower1:upper1)' so that downstream call ops emit
+    the correct Fortran array-section notation.
 
-    lowers and uppers must have the same length (one pair per dimension).
+    lowers and uppers must have the same length (one pair per dimension).  A
+    dimension whose lower and upper bound are the same SSA value is a single
+    index, which removes that dimension from the result.
     """
 
     name = "ccpp_utils.array_section"
@@ -204,11 +206,11 @@ class ArraySectionOp(IRDLOperation):
 
     irdl_options = [AttrSizedOperandSegments()]
 
-    def __init__(self, source, lowers, uppers):
+    def __init__(self, source, lowers, uppers, result_type=None):
         source_val = SSAValue.get(source)
         super().__init__(
             operands=[source, list(lowers), list(uppers)],
-            result_types=[source_val.type],
+            result_types=[result_type or source_val.type],
         )
 
 
@@ -332,6 +334,231 @@ class KeywordCallOp(IRDLOperation):
         )
 
 
+@irdl_op_definition
+class FortranExprOp(IRDLOperation):
+    """A Fortran expression, such as a constant or an ``active`` condition."""
+
+    name = "ccpp_utils.fortran_expr"
+
+    text = prop_def(StringAttr)
+    res = result_def()
+
+    def __init__(self, text: str, result_type):
+        super().__init__(
+            properties={"text": StringAttr(text)}, result_types=[result_type]
+        )
+
+
+@irdl_op_definition
+class SuiteVarOp(IRDLOperation):
+    """Declare a module variable holding data that persists between phases.
+
+    Arrays are allocatable.  ``initial_value`` is an optional Fortran expression.
+    """
+
+    name = "ccpp_utils.suite_var"
+
+    var_name = prop_def(StringAttr)
+    var_type = prop_def(MemRefType)
+    initial_value = opt_prop_def(StringAttr)
+
+    def __init__(self, var_name: str, var_type, initial_value: str | None = None):
+        properties: dict = {"var_name": StringAttr(var_name), "var_type": var_type}
+        if initial_value is not None:
+            properties["initial_value"] = StringAttr(initial_value)
+        super().__init__(properties=properties)
+
+
+@irdl_op_definition
+class AllocateOp(IRDLOperation):
+    """Allocate a suite array, unless it is already allocated.
+
+    ``initial_value`` is an optional Fortran expression to assign to it.
+    """
+
+    name = "ccpp_utils.allocate"
+
+    var = operand_def(MemRefType)
+    lowers = var_operand_def(MemRefType | IntegerType)
+    uppers = var_operand_def(MemRefType | IntegerType)
+    initial_value = opt_prop_def(StringAttr)
+
+    irdl_options = [AttrSizedOperandSegments()]
+
+    def __init__(self, var, lowers, uppers, initial_value: str | None = None):
+        properties = {}
+        if initial_value is not None:
+            properties["initial_value"] = StringAttr(initial_value)
+        super().__init__(
+            operands=[var, list(lowers), list(uppers)], properties=properties
+        )
+
+
+@irdl_op_definition
+class DeallocateOp(IRDLOperation):
+    """Deallocate a suite array, if it is allocated."""
+
+    name = "ccpp_utils.deallocate"
+
+    var = operand_def(MemRefType)
+
+    def __init__(self, var):
+        super().__init__(operands=[var])
+
+
+@irdl_op_definition
+class SuiteVariablesFnOp(IRDLOperation):
+    """Generate ccpp_physics_suite_variables, which reports what suites need.
+
+    ``variables`` maps each suite name to ``[[inputs...], [outputs...]]``, as lists
+    of standard names.
+    """
+
+    name = "ccpp_utils.suite_variables_fn"
+
+    variables = prop_def(DictionaryAttr)
+
+    def __init__(self, variables: DictionaryAttr):
+        super().__init__(properties={"variables": variables})
+
+
+@irdl_op_definition
+class SuiteConstituentsOp(IRDLOperation):
+    """Generate the routines through which a suite cap describes its constituents.
+
+    ``constituents`` is a list of dictionaries of strings, one for each constituent
+    that the suite makes, with its ``std_name``, ``long_name``, ``units``,
+    ``vertical_dim``, ``advected`` and ``default_value`` (empty for none).  The host
+    cap uses the generated routines to register the constituents.
+    """
+
+    name = "ccpp_utils.suite_constituents"
+
+    suite_name = prop_def(StringAttr)
+    constituents = prop_def(ArrayAttr)
+
+    def __init__(self, suite_name: str, constituents: ArrayAttr):
+        super().__init__(
+            properties={
+                "suite_name": StringAttr(suite_name),
+                "constituents": constituents,
+            }
+        )
+
+
+@irdl_op_definition
+class HostConstituentsOp(IRDLOperation):
+    """Generate the host cap routines that manage the constituents of all suites.
+
+    ``suites`` lists dictionaries of strings: the suite ``name``, the ``module`` of
+    its cap and whether it makes constituents at run time (``dynamic``).
+    ``stdnames`` holds the standard names of all constituents that suites make, and
+    ``errflg`` and ``errmsg`` name the error arguments of the routines.
+    """
+
+    name = "ccpp_utils.host_constituents"
+
+    host_name = prop_def(StringAttr)
+    suites = prop_def(ArrayAttr)
+    stdnames = prop_def(ArrayAttr)
+    errflg = prop_def(StringAttr)
+    errmsg = prop_def(StringAttr)
+
+    def __init__(
+        self,
+        host_name: str,
+        suites: ArrayAttr,
+        stdnames: ArrayAttr,
+        errflg: str = "errflg",
+        errmsg: str = "errmsg",
+    ):
+        super().__init__(
+            properties={
+                "host_name": StringAttr(host_name),
+                "suites": suites,
+                "stdnames": stdnames,
+                "errflg": StringAttr(errflg),
+                "errmsg": StringAttr(errmsg),
+            }
+        )
+
+
+@irdl_op_definition
+class PackConstituentsOp(IRDLOperation):
+    """Collect constituents made by schemes at run time into one allocatable array.
+
+    ``sources`` names the local arrays that suite register calls filled in.  They
+    are copied into ``array`` and deallocated, unless the call set ``errflg``.
+    """
+
+    name = "ccpp_utils.pack_constituents"
+
+    array = prop_def(StringAttr)
+    sources = prop_def(ArrayAttr)
+    errflg = prop_def(StringAttr)
+    counter = prop_def(StringAttr)
+    index = prop_def(StringAttr)
+
+    def __init__(
+        self,
+        array: str,
+        sources: ArrayAttr,
+        errflg: str,
+        counter: str = "ccpp_num_dyn_consts",
+        index: str = "ccpp_dyn_const_index",
+    ):
+        super().__init__(
+            properties={
+                "array": StringAttr(array),
+                "sources": sources,
+                "errflg": StringAttr(errflg),
+                "counter": StringAttr(counter),
+                "index": StringAttr(index),
+            }
+        )
+
+
+@irdl_op_definition
+class PointerDeclOp(IRDLOperation):
+    """Declare a local pointer, initially disassociated.
+
+    The result type gives the type and rank of what the pointer points to.  A
+    disassociated pointer passed to an optional dummy argument is absent.
+    """
+
+    name = "ccpp_utils.pointer_decl"
+
+    res = result_def(MemRefType)
+
+    def __init__(self, result_type):
+        super().__init__(result_types=[result_type])
+
+
+@irdl_op_definition
+class PointerAssociateOp(IRDLOperation):
+    """Associate a local pointer with a target: ``pointer => target``."""
+
+    name = "ccpp_utils.pointer_associate"
+
+    pointer = operand_def(MemRefType)
+    target = operand_def()
+
+    def __init__(self, pointer, target):
+        super().__init__(operands=[pointer, target])
+
+
+@irdl_op_definition
+class PointerNullifyOp(IRDLOperation):
+    """Disassociate a local pointer: ``nullify(pointer)``."""
+
+    name = "ccpp_utils.pointer_nullify"
+
+    pointer = operand_def(MemRefType)
+
+    def __init__(self, pointer):
+        super().__init__(operands=[pointer])
+
+
 CCPPUtils = Dialect(
     "ccpp_utils",
     [
@@ -343,6 +570,17 @@ CCPPUtils = Dialect(
         KindDefOp,
         SetStringOp,
         KeywordCallOp,
+        FortranExprOp,
+        SuiteVarOp,
+        AllocateOp,
+        DeallocateOp,
+        SuiteVariablesFnOp,
+        SuiteConstituentsOp,
+        HostConstituentsOp,
+        PackConstituentsOp,
+        PointerDeclOp,
+        PointerAssociateOp,
+        PointerNullifyOp,
     ],
     [RealKindType, DerivedType],
 )

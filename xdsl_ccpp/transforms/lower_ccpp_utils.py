@@ -494,6 +494,26 @@ def _lower_external_calls(module: builtin.ModuleOp) -> None:
             )
 
 
+def _cast_copy_operands(module: builtin.ModuleOp) -> None:
+    """Make ``memref.copy`` type-correct after host variables became ``!llvm.ptr``.
+
+    An operand lowered to a pointer is cast back to the memref type of the other
+    operand.  The two casts of a copy between two pointers are not needed because
+    such a copy has no memref type to go through and cannot arise from a cap.
+    """
+    for op in list(module.walk()):
+        if not isinstance(op, memref.CopyOp):
+            continue
+        source, destination = op.source, op.destination
+        for operand, other, idx in ((source, destination, 0), (destination, source, 1)):
+            if isinstance(operand.type, LLVMPointerType) and isinstance(
+                other.type, MemRefType
+            ):
+                cast = UnrealizedConversionCastOp.get([operand], [other.type])
+                op.parent.insert_op_before(cast, op)
+                op.operands[idx] = cast.results[0]
+
+
 @dataclass(frozen=True)
 class LowerCCPPUtils(ModulePass):
     name = "lower-ccpp-utils"
@@ -512,3 +532,4 @@ class LowerCCPPUtils(ModulePass):
         ).rewrite_module(op)
         _lower_real_kind_types(op)
         _lower_external_calls(op)
+        _cast_copy_operands(op)

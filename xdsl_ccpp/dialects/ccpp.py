@@ -98,6 +98,9 @@ class GroupOp(IRDLOperation):
 
         properties = {"group_name": group_name}
 
+        if not isinstance(body, Region):
+            body = Region([Block(body)])
+
         super().__init__(regions=[body], properties=properties)
 
 
@@ -125,6 +128,32 @@ class SchemeOp(IRDLOperation):
             )
 
         super().__init__(properties=properties)
+
+
+@irdl_op_definition
+class SubcycleOp(IRDLOperation):
+    """Schemes of a group that the suite repeats ``loop`` times in the run phase.
+
+    The loop counter and extent are the CCPP standard names ``ccpp_loop_counter`` and
+    ``ccpp_loop_extent``.  Other phases call the schemes once.
+    """
+
+    name = "ccpp.subcycle"
+
+    loop = prop_def(IntAttr)
+
+    body = region_def("single_block")
+
+    traits = traits_def(
+        NoTerminator(),
+    )
+
+    def __init__(self, loop: int | IntAttr, body: Region | Sequence[Operation]):
+        if isa(loop, int):
+            loop = IntAttr(loop)
+        if not isinstance(body, Region):
+            body = Region([Block(body)])
+        super().__init__(regions=[body], properties={"loop": loop})
 
 
 class TableBaseOp(IRDLOperation):
@@ -161,6 +190,21 @@ class TableBaseOp(IRDLOperation):
 @irdl_op_definition
 class TablePropertiesOp(TableBaseOp):
     name = "ccpp.table_properties"
+
+    # Fortran module defining this table. Only set for DDT tables, whose type
+    # has to be imported by any cap that declares a variable of that type.
+    module = opt_prop_def(StringAttr)
+
+    def __init__(
+        self,
+        table_name: str | StringAttr,
+        table_type: str | TableTypeKindAttr,
+        body: Region | Sequence[Operation] | Sequence[Block],
+        module: str | None = None,
+    ):
+        super().__init__(table_name, table_type, body)
+        if module is not None:
+            self.properties["module"] = StringAttr(module)
 
 
 @irdl_op_definition
@@ -229,6 +273,16 @@ class ArgumentOp(IRDLOperation):
     intent = opt_prop_def(StringAttr)
     units = opt_prop_def(StringAttr)
     optional = opt_prop_def(UnitAttr)
+    allocatable = opt_prop_def(UnitAttr)
+    protected = opt_prop_def(UnitAttr)
+    # Fortran-like condition on standard names, when a variable may not exist
+    active = opt_prop_def(StringAttr)
+    # Value of a suite variable that no scheme sets before it is read
+    default_value = opt_prop_def(StringAttr)
+    # Properties that make a variable a constituent, which the framework manages
+    advected = opt_prop_def(UnitAttr)
+    constituent = opt_prop_def(UnitAttr)
+    molar_mass = opt_prop_def(StringAttr)
 
     def __init__(
         self, arg_name: str | StringAttr, arg_type: str | StringAttr, attributes
@@ -254,17 +308,20 @@ class ArgumentOp(IRDLOperation):
             ndims = len(dim_parts)
             if ndims > 0:
                 properties["dimensions"] = IntAttr(ndims)
-                # Store dimension standard names (handle range notation like
-                # 'ccpp_constant_one:horizontal_loop_extent' → take upper bound)
-                parsed_dims = []
-                for d in dim_parts:
-                    if ":" in d:
-                        d = d.split(":")[1].strip()
-                    parsed_dims.append(d)
-                properties["dim_names"] = StringAttr(",".join(parsed_dims))
+                # Store each dimension as written, which can be a range such as
+                # 'ccpp_constant_one:horizontal_loop_extent'
+                properties["dim_names"] = StringAttr(",".join(dim_parts))
             prop_keys.remove("dimensions")
 
-        known_props = ["standard_name", "long_name", "kind", "intent", "units"]
+        known_props = [
+            "standard_name",
+            "long_name",
+            "kind",
+            "intent",
+            "units",
+            "active",
+            "default_value",
+        ]
         for prop in known_props:
             if prop in attributes:
                 properties[prop] = StringAttr(attributes[prop])
@@ -275,7 +332,17 @@ class ArgumentOp(IRDLOperation):
                 properties["optional"] = UnitAttr()
                 prop_keys.remove("optional")
 
-        # Silently ignore unrecognised keys (e.g. state_variable, allocatable)
+        if attributes.get("allocatable", "").lower() == "true":
+            properties["allocatable"] = UnitAttr()
+        if attributes.get("protected", "").lower() == "true":
+            properties["protected"] = UnitAttr()
+        for flag in ("advected", "constituent"):
+            if attributes.get(flag, "").lower().strip(".") == "true":
+                properties[flag] = UnitAttr()
+        if "molar_mass" in attributes:
+            properties["molar_mass"] = StringAttr(attributes["molar_mass"])
+
+        # Silently ignore unrecognised keys (e.g. state_variable)
 
         super().__init__(properties=properties)
 
@@ -286,6 +353,7 @@ CCPP = Dialect(
         SuiteOp,
         GroupOp,
         SchemeOp,
+        SubcycleOp,
         KindOp,
         KindsOp,
         TablePropertiesOp,

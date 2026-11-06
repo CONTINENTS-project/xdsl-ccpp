@@ -7,6 +7,8 @@ from xdsl.rewriter import InsertPoint, Rewriter
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects import ccpp
+from xdsl_ccpp.transforms.util.ccpp_descriptors import BuildMetaDataDescriptions
+from xdsl_ccpp.transforms.util.variables import host_kinds
 
 
 @dataclass(frozen=True)
@@ -22,7 +24,8 @@ class MetaKind(ModulePass):
     module's body, containing one ``ccpp.kind`` op per unique kind name.  The
     kind ops appear in the order they were first encountered.
 
-    If no real kinds are present, the ``@ccpp`` module is left unchanged.
+    If no real kinds are present, the ``@ccpp`` module is left unchanged.  Kinds that a
+    host module defines are not generated, because the caps use those of the host.
 
     Pipeline position: generate-meta-cap → **generate-meta-kinds** → generate-suite-cap
     """
@@ -64,6 +67,11 @@ class MetaKind(ModulePass):
                         and "len=" not in arg_op.kind.data
                     ):
                         kind_names[arg_op.kind.data] = None
+
+        descriptions = BuildMetaDataDescriptions()
+        descriptions.traverse(ccpp_module)
+        for host_kind in host_kinds(descriptions.meta_data):
+            kind_names.pop(host_kind, None)
 
         if not kind_names:
             return

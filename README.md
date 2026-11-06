@@ -38,6 +38,12 @@ This generates three Fortran files in `output/`:
 | `hello_world_suite_cap.F90` | Suite cap subroutines for `hello_world_suite` |
 | `hello_world_ccpp_cap.F90` | Host-facing cap (`ccpp_physics_initialize`, `ccpp_physics_run`, etc.) |
 
+Host variables are found by standard name in the `--host-files` metadata. Pass the `type = host` metadata as well for the host cap to take the same arguments as the host program. An argument with no owner becomes an extra dummy argument of the host cap.
+
+### Constituents
+
+A scheme variable whose metadata has `advected`, `constituent` or a non-zero `molar_mass`, and which no host module provides, is a constituent. The host cap holds a `ccpp_model_constituents_t` object and passes slices of its arrays to the suite cap, and `ccpp_constituents`, `ccpp_constituent_tendencies` and `number_of_ccpp_constituents` map onto the object. Schemes that return an allocatable `ccpp_constituent_properties_t` array in their register phase make constituents at run time. When any suite has constituents, the suite caps gain `<suite>_constituents_num_consts`, `_const_name` and `_copy_const`, and the host cap gains `<host>_ccpp_register_constituents`, `_initialize_constituents`, `_number_constituents`, `_is_scheme_constituent`, `_gather_constituents`, `_update_constituents`, `_deallocate_dynamic_constituents`, `<host>_constituents_array`, `_advected_constituents_array`, `_model_const_properties` and `_const_get_index`.
+
 ### Driver Options
 
 ```
@@ -53,9 +59,39 @@ Optional:
   --stdout              Print generated Fortran to stdout instead of files
   --host-name           Override the CamelCase host name prefix (e.g. HelloWorld);
                         derived from the suite name when not set
+  --static-api          Write the static API of hosts that link the caps statically,
+                        such as the CCPP Single Column Model (see below)
+  --static-api-name     Name of the static API module (default: ccpp_static_api)
   -t, --tempdir         Temporary directory for intermediate files (default: tmp)
   -v, --verbose         Verbosity level: 0=quiet, 1=normal, 2=detailed (default: 1)
 ```
+
+### Static API (Single Column Model)
+
+With `--static-api` the output is the suite cap `<suite>_cap` and a module `ccpp_static_api`
+with `ccpp_physics_init`, `_timestep_init`, `_run`, `_timestep_finalize` and `_finalize`.
+Each takes `(cdata, suite_name, group_name, ierr)` as the API that the CCPP framework
+prebuild (`ccpp_prebuild.py`) generates, so that a host such as the SCM calls it unchanged.
+Only `ccpp_physics_run` takes a `group_name`. No host cap is written. The differences with
+the default output are:
+
+- The suite cap subroutines take no arguments in the run phase. The host provides the loop
+  bounds (`horizontal_loop_begin`, `horizontal_loop_end`, `horizontal_loop_extent`), for
+  instance as `chunk_begin(ccpp_chunk_number)`, and the API hands the error flag and message to
+  the `ccpp_t` object of the host, whose type must be in the host metadata.
+- Variables are read from the modules of the host, so the `cdata` that the host passes has to be
+  the module variable that the host metadata declares. Members of a type that the host
+  declares as an array element, such as `Interstitial(ccpp_thread_number)`, are selected with
+  that index.
+- A scheme gets the extent that its metadata declares for each array, as in the CCPP
+  framework, rather than the whole host array.
+- Kinds that a host module defines (for example `kind_phys` in `machine`) are imported from
+  that module, and no `ccpp_kinds` module is written for them.
+
+In both modes the schemes of a `<subcycle loop="N">` run N times in the run phase, once in the
+other phases. `ccpp_loop_counter` and `ccpp_loop_extent` are the members of the host that have
+those standard names (for `cdata`, `loop_cnt` and `loop_max`), which the cap sets for every
+subcycle, or the values of the loop if the host has none.
 
 ## Examples
 

@@ -2,25 +2,55 @@ from dataclasses import dataclass
 
 from xdsl.context import Context
 from xdsl.dialects import arith, builtin, func, llvm, memref, scf
-from xdsl.dialects.builtin import DYNAMIC_INDEX, IndexType, IntegerAttr, StringAttr, i8
+from xdsl.dialects.builtin import (
+    DYNAMIC_INDEX,
+    ArrayAttr,
+    DictionaryAttr,
+    IndexType,
+    IntegerAttr,
+    StringAttr,
+    i8,
+)
 from xdsl.ir import Block, Region
 from xdsl.passes import ModulePass
 from xdsl.utils.hints import isa
 
 from xdsl_ccpp.dialects.ccpp_utils import (
-    ArraySectionOp,
+    DerivedType,
+    HostConstituentsOp,
     HostVarRefOp,
+    PackConstituentsOp,
     SetStringOp,
     StrCmpOp,
+    SuiteVariablesFnOp,
     TrimOp,
     WriteErrMsgOp,
 )
+from xdsl_ccpp.transforms.util import constituents as ccpp_consts
 from xdsl_ccpp.transforms.util.ccpp_descriptors import (
     BuildMetaDataDescriptions,
     BuildSchemeDescription,
-    CCPPType,
 )
 from xdsl_ccpp.transforms.util.typing import TypeConversions
+from xdsl_ccpp.transforms.util.variables import (
+    ERROR_CODE,
+    ERROR_MESSAGE,
+    LOOP_BEGIN,
+    LOOP_END,
+    VERTICAL_LAYER,
+    control_arguments,
+    host_variables,
+    required_variables,
+)
+
+
+def _is_dynamic_type(arg_type):
+    """Return True for an array of constituents that schemes make at run time."""
+    element = arg_type.element_type if isinstance(arg_type, memref.MemRefType) else None
+    return (
+        isinstance(element, DerivedType)
+        and element.type_name.data == ccpp_consts.CONSTITUENT_TYPE
+    )
 
 
 @dataclass(frozen=True)
@@ -59,9 +89,10 @@ class CCPPCAP(ModulePass):
 
         Returns:
             dict mapping function_name → (module_name, output_types,
-            input_types, input_names).
+            input_types, input_names, output_names).
         """
         public_fns = {}
+        arg_properties = {}
         for op in ops:
             if not (isa(op, builtin.ModuleOp) and op.sym_name is not None):
                 continue
@@ -73,13 +104,20 @@ class CCPPCAP(ModulePass):
                     and child.sym_visibility is not None
                     and child.sym_visibility.data == "public"
                 ):
+                    ret_op = child.body.block.last_op
                     public_fns[child.sym_name.data] = (
                         mod_name,
                         list(child.function_type.outputs),
                         list(child.function_type.inputs),
                         [arg.name_hint for arg in child.body.block.args],
+                        [val.name_hint for val in ret_op.operands],
                     )
-        return public_fns
+                    arg_properties[child.sym_name.data] = (
+                        [a.data for a in child.attributes["ftn_arg_intents"]],
+                        {a.data for a in child.attributes["ftn_allocatable_args"]},
+                        [a.data for a in child.attributes["ftn_arg_standard_names"]],
+                    )
+        return public_fns, arg_properties
 
     def _derive_camel_case_name(self, suite_name: str) -> str:
         """Convert a snake_case suite name to CamelCase, stripping any '_suite' suffix."""
@@ -88,519 +126,320 @@ class CCPPCAP(ModulePass):
             name = name[:-6]
         return "".join(word.capitalize() for word in name.split("_"))
 
-    def _get_suite_lifecycle_return_types(self, scheme_names, meta_data, table_postfix):
-        """Derive the ordered return types of a suite lifecycle subroutine."""
-        all_out_args = {}
-        for scheme_name in scheme_names:
-            table_name = scheme_name + table_postfix
-            if table_name not in meta_data[scheme_name].arg_tables:
-                continue
-            arg_table = meta_data[scheme_name].getArgTable(table_name)
-            for fn_arg in arg_table.getFunctionArguments():
-                if (
-                    fn_arg.getAttr("intent") == "out"
-                    and fn_arg.name not in all_out_args
-                ):
-                    all_out_args[fn_arg.name] = fn_arg
+    def _control_dummies(self, meta_data):
+        """Return the host cap dummy arguments and where control values live.
 
-        return [
-            TypeConversions.convert(
-                arg.getAttr("type"),
-                arg.getAttr("kind") if arg.hasAttr("kind") else None,
-                0,
-            )
-            for arg in all_out_args.values()
+        These are the variables of the host metadata table.  Without one, the host
+        cap takes the arguments that the CCPP framework documents.  Returns
+        ``([(name, type, standard_names), ...], {standard_name: expression})``.
+        """
+        args, expressions = control_arguments(meta_data)
+        if args:
+            dummies = []
+            for arg in args:
+                provided = {
+                    std_name
+                    for std_name, expression in expressions.items()
+                    if expression == arg.name or expression.startswith(arg.name + "%")
+                }
+                dummies.append((arg.name, TypeConversions.convert_arg(arg), provided))
+            return dummies, expressions
+
+        integer_type = TypeConversions.convert("integer")
+        errmsg_type = TypeConversions.convert("character", "len=512")
+        dummies = [
+            ("col_start", integer_type, {LOOP_BEGIN}),
+            ("col_end", integer_type, {LOOP_END}),
+            ("errmsg", errmsg_type, {ERROR_MESSAGE}),
+            ("errflg", integer_type, {ERROR_CODE}),
         ]
+        return dummies, {std: name for name, _, stds in dummies for std in stds}
 
-    def _generate_lifecycle_fn(
-        self,
-        fn_name,
-        suite_entries,
-        suite_name_type,
-        errmsg_type,
-        errflg_type,
-        char_base,
-        int_base,
-        public_fns,
-    ):
-        """Build one combined CCPP cap lifecycle FuncOp dispatching over all suites.
+    def _control_value(self, std_name, value_type, block_args, ctx):
+        """Return ``(ops, value)`` for a control value such as the error flag."""
+        expression = ctx["control_expressions"][std_name]
+        if expression in block_args:
+            return [], block_args[expression]
+        ref = HostVarRefOp(expression, "", value_type)
+        return [ref], ref.res
 
-        ``suite_entries`` is a list of ``(suite_name, suite_callee, call_ret_types)``
-        tuples.  Generates a nested if/else chain that checks ``suite_name`` against
-        each suite's name literal and calls the corresponding suite cap subroutine.
+    @staticmethod
+    def _plain_name(expression, default):
+        """Return an expression that names a dummy argument, or else a default."""
+        return expression if expression.isidentifier() else default
+
+    def _constituent_value(self, std_name, arg_type, run_phase, ctx):
+        """Return an op referencing the constituents data for a standard name.
+
+        In the run phase the data is limited to the columns and levels of the call.
+        """
+        horizontal = vertical = ":"
+        if run_phase:
+            expressions = ctx["control_expressions"]
+            horizontal = f"{expressions[LOOP_BEGIN]}:{expressions[LOOP_END]}"
+            layers = ctx["host"].get(VERTICAL_LAYER)
+            if layers is not None:
+                ctx["host_imports"][layers.root] = layers.module
+                vertical = f"1:{layers.expression}"
+        expression = ctx["constituents"].expression(std_name, horizontal, vertical)
+        return HostVarRefOp(expression, "", arg_type)
+
+    def _build_part_call(self, callee, suite_name, block_args, control, run_phase, ctx):
+        """Build the ops for one suite cap call.
+
+        Returns ``(ops, declaration, locals)``.  Constituents are not arguments of the
+        host cap: the call passes the data of the constituents object, and arrays of
+        constituents that schemes make at run time are local arrays, which the ops
+        pack into the array of the suite.  *locals* names those arrays.
+        """
+        module, output_types, input_types, input_names, output_names = ctx[
+            "public_fns"
+        ][callee]
+        _, _, std_names = ctx["arg_properties"][callee]
+        constituents = ctx["constituents"]
+        ops = []
+        dynamic = []
+        call_args = []
+        for name, arg_type, std_name in zip(input_names, input_types, std_names):
+            if name in control:
+                call_args.append(control[name])
+            elif name in block_args:
+                call_args.append(block_args[name])
+            elif _is_dynamic_type(arg_type):
+                dynamic.append(name)
+                ref = HostVarRefOp(name, "", arg_type)
+                ops.append(ref)
+                call_args.append(ref.res)
+            else:
+                assert constituents is not None
+                assert constituents.provides(std_name)
+                ref = self._constituent_value(std_name, arg_type, run_phase, ctx)
+                ops.append(ref)
+                call_args.append(ref.res)
+        call_op = func.CallOp(callee, call_args, output_types)
+        call_op.attributes["ftn_arg_names"] = ArrayAttr(
+            [StringAttr(name) for name in input_names]
+        )
+        call_op.attributes["ftn_result_names"] = ArrayAttr(
+            [StringAttr(name) for name in output_names]
+        )
+        copies = [
+            memref.CopyOp(result, control[name])
+            for result, name in zip(call_op.results, output_names)
+        ]
+        ops += [call_op, *copies]
+        if dynamic:
+            ops.append(
+                PackConstituentsOp(
+                    f"{suite_name}_dynamic_constituents",
+                    ArrayAttr([StringAttr(name) for name in dynamic]),
+                    ctx["control_expressions"][ERROR_CODE],
+                )
+            )
+        decl = func.FuncOp.external(callee, input_types, output_types)
+        decl.attributes["module"] = StringAttr(module)
+        return ops, decl, dynamic
+
+    def _generate_dispatch_fn(self, fn_name, suite_entries, has_parts, ctx):
+        """Build one host cap subroutine dispatching over all suites.
+
+        ``suite_entries`` is a list of ``(suite_name, parts)`` where ``parts`` is a
+        list of ``(part_name, suite_callee)``.  The generated code has a nested
+        if/else chain on ``suite_name`` and, when *has_parts* is set, an inner chain
+        on ``suite_part``.  Its dummy arguments are the suite name (and part), the
+        host control arguments, then any arguments that have no owner.
 
         Returns ``(FuncOp, [external_decl_FuncOp, ...])``.
         """
-        for _, suite_callee, _ in suite_entries:
-            assert suite_callee in public_fns, (
-                f"Suite callee '{suite_callee}' not found among public suite cap "
-                f"functions; available: {sorted(public_fns)}"
-            )
+        suite_name_type = ctx["suite_name_type"]
+        errmsg_type = ctx["errmsg_type"]
+        errflg_type = ctx["errflg_type"]
 
-        errmsg_alloc = memref.AllocaOp.get(char_base, shape=[512])
-        errmsg_alloc.memref.name_hint = "errmsg"
-        errflg_alloc = memref.AllocaOp.get(int_base, shape=[])
-        errflg_alloc.memref.name_hint = "errflg"
+        # Loop bounds only exist in the run phase
+        control_dummies = [
+            dummy
+            for dummy in ctx["control_dummies"]
+            if has_parts or not dummy[2] <= {LOOP_BEGIN, LOOP_END}
+        ]
 
-        new_block = Block(arg_types=[suite_name_type])
+        # Union of the arguments with no owner, by first appearance
+        union_args: dict = {}
+        union_intents: dict = {}
+        allocatable_args: set = set()
+        control_args: dict = {}
+        for _, parts in suite_entries:
+            for _, callee in parts:
+                assert callee in ctx["public_fns"], (
+                    f"Suite callee '{callee}' not found; "
+                    f"available: {sorted(ctx['public_fns'])}"
+                )
+                _, _, input_types, input_names, _ = ctx["public_fns"][callee]
+                intents, allocatable, std_names = ctx["arg_properties"][callee]
+                for name, arg_type, intent, std_name in zip(
+                    input_names, input_types, intents, std_names
+                ):
+                    if name in ("col_start", "col_end"):
+                        continue
+                    if std_name in ctx["control_expressions"]:
+                        # A scheme can ask for the host control data itself
+                        control_args[name] = (std_name, arg_type)
+                        continue
+                    if _is_dynamic_type(arg_type) or (
+                        ctx["constituents"] is not None
+                        and ctx["constituents"].provides(std_name)
+                    ):
+                        # The host cap makes these, rather than being given them
+                        continue
+                    if name in union_args and union_intents[name] != intent:
+                        intent = "inout"
+                    union_args.setdefault(name, arg_type)
+                    union_intents[name] = intent
+                    if name in allocatable:
+                        allocatable_args.add(name)
+
+        leading_types = [suite_name_type] + ([suite_name_type] if has_parts else [])
+        all_block_types = [
+            *leading_types,
+            *[dummy[1] for dummy in control_dummies],
+            *union_args.values(),
+        ]
+        new_block = Block(arg_types=all_block_types)
         new_block.args[0].name_hint = "suite_name"
+        suite_part_arg = None
+        if has_parts:
+            suite_part_arg = new_block.args[1]
+            suite_part_arg.name_hint = "suite_part"
+
+        block_args = {}
+        names = [*[dummy[0] for dummy in control_dummies], *union_args]
+        for arg, name in zip(new_block.args[len(leading_types) :], names):
+            arg.name_hint = name
+            block_args[name] = arg
+
+        control_ops, errmsg_value = self._control_value(
+            ERROR_MESSAGE, errmsg_type, block_args, ctx
+        )
+        errflg_ops, errflg_value = self._control_value(
+            ERROR_CODE, errflg_type, block_args, ctx
+        )
+        control_ops += errflg_ops
+        control = {"errmsg": errmsg_value, "errflg": errflg_value}
+        for name, (std_name, arg_type) in control_args.items():
+            ops, control[name] = self._control_value(
+                std_name, arg_type, block_args, ctx
+            )
+            control_ops += ops
+        if has_parts:
+            for name, std_name in (("col_start", LOOP_BEGIN), ("col_end", LOOP_END)):
+                ops, value = self._control_value(std_name, errflg_type, block_args, ctx)
+                control_ops += ops
+                control[name] = value
 
         err_const = arith.ConstantOp.from_int_and_width(0, 32)
-        store_errflg = memref.StoreOp.get(err_const, errflg_alloc, [])
-
+        store_errflg = memref.StoreOp.get(err_const, errflg_value, [])
         trim_suite_name = TrimOp(new_block.args[0])
 
         # Innermost else: no suite matched
         write_err = WriteErrMsgOp(
-            errmsg_alloc, trim_suite_name.res, "No suite named ", "found"
+            errmsg_value, trim_suite_name.res, "No suite named ", "found"
         )
         one_err = arith.ConstantOp.from_int_and_width(1, 32)
-        store_errflg_err = memref.StoreOp.get(one_err, errflg_alloc, [])
+        store_err = memref.StoreOp.get(one_err, errflg_value, [])
+        current_false_ops = [write_err, one_err, store_err, scf.YieldOp()]
 
-        # Build nested if/else chain from inside out (reverse iteration)
-        current_false_ops = [write_err, one_err, store_errflg_err, scf.YieldOp()]
-
-        for suite_name, suite_callee, call_ret_types in reversed(suite_entries):
-            strcmp_op = StrCmpOp(trim_suite_name.res, literal=suite_name)
-            call_op = func.CallOp(suite_callee, [], call_ret_types)
-            copy_ops = []
-            for idx, ret_type in enumerate(call_ret_types):
-                if ret_type == errmsg_type:
-                    copy_ops.append(memref.CopyOp(call_op.results[idx], errmsg_alloc))
-                elif ret_type == errflg_type:
-                    copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_alloc))
-            if_op = scf.IfOp(
-                strcmp_op.res,
-                [],
-                [call_op] + copy_ops + [scf.YieldOp()],
-                current_false_ops,
-            )
-            current_false_ops = [strcmp_op, if_op, scf.YieldOp()]
-
-        # Strip trailing YieldOp — main block ends with ReturnOp, not YieldOp
-        main_chain_ops = current_false_ops[:-1]
-
-        ret_op = func.ReturnOp(errmsg_alloc, errflg_alloc)
-
-        new_block.add_ops(
-            [
-                errmsg_alloc,
-                errflg_alloc,
-                err_const,
-                store_errflg,
-                trim_suite_name,
-                *main_chain_ops,
-                ret_op,
-            ]
-        )
-
-        body = Region()
-        body.add_block(new_block)
-
-        fn_type = builtin.FunctionType.from_lists(
-            [suite_name_type],
-            [errmsg_type, errflg_type],
-        )
-        cap_fn = func.FuncOp(fn_name, fn_type, body, visibility="public")
-
-        decls = []
-        for _, suite_callee, call_ret_types in suite_entries:
-            callee_module, _, _, _ = public_fns[suite_callee]
-            decl = func.FuncOp.external(suite_callee, [], call_ret_types)
-            decl.attributes["module"] = StringAttr(callee_module)
-            decls.append(decl)
-
-        return cap_fn, decls
-
-    def _generate_run_fn(
-        self,
-        fn_name,
-        suite_run_entries,
-        suite_name_type,
-        errmsg_type,
-        errflg_type,
-        char_base,
-        int_base,
-        public_fns,
-        meta_data,
-    ):
-        """Build the combined CCPP cap physics run FuncOp dispatching over all suites.
-
-        ``suite_run_entries`` is a list of
-        ``(suite_name, suite_part, suite_callee, scheme_names)`` tuples.
-
-        The generated function signature uses the union of non-host physics args
-        across all suites.  A nested if/else chain on ``suite_name`` dispatches to
-        the appropriate suite; each matching branch has an inner if/else on
-        ``suite_part``.  Host variable references and array sections are placed
-        inside each suite's branch.
-
-        Returns ``(FuncOp, [external_decl_FuncOp, ...], host_global_ops)``.
-        """
-        for _, _, suite_callee, _ in suite_run_entries:
-            assert suite_callee in public_fns, (
-                f"Suite callee '{suite_callee}' not found; available: {sorted(public_fns)}"
-            )
-
-        suite_part_type = suite_name_type
-
-        # ── Build {standard_name → (host_var_name, module_name)} from MODULE metadata ──
-        host_var_map = {}
-        for tbl_name, props in meta_data.items():
-            if props.getAttr("type") != CCPPType.MODULE:
-                continue
-            if tbl_name not in props.arg_tables:
-                continue
-            for var in props.getArgTable(tbl_name).getFunctionArguments():
-                if var.hasAttr("standard_name"):
-                    host_var_map[var.getAttr("standard_name")] = (var.name, tbl_name)
-
-        # ── Per-suite information ──────────────────────────────────────────────
-        per_suite = []
-        all_host_global_ops: list = []
-        seen_host_globals: set = set()
-
-        for suite_name, suite_part, suite_callee, scheme_names in suite_run_entries:
-            (
-                callee_module,
-                callee_output_types,
-                callee_input_types,
-                callee_input_names,
-            ) = public_fns[suite_callee]
-
-            # Build {local_arg_name → standard_name} from the _run arg tables.
-            std_name_of = {}
-            for scheme_name in scheme_names:
-                table_name = scheme_name + "_run"
-                if scheme_name not in meta_data:
-                    continue
-                if table_name not in meta_data[scheme_name].arg_tables:
-                    continue
-                for fn_arg in (
-                    meta_data[scheme_name]
-                    .getArgTable(table_name)
-                    .getFunctionArguments()
-                ):
-                    if fn_arg.name not in std_name_of and fn_arg.hasAttr(
-                        "standard_name"
-                    ):
-                        std_name_of[fn_arg.name] = fn_arg.getAttr("standard_name")
-
-            # Classify each callee input arg as host-mapped or plain block arg.
-            physics_arg_sources = []
-            for arg_name in callee_input_names:
-                std_name = std_name_of.get(arg_name)
-                if std_name and std_name in host_var_map:
-                    host_var_name, host_module_name = host_var_map[std_name]
-                    assert host_var_name in (
-                        meta_data[host_module_name]
-                        .arg_tables[host_module_name]
-                        .function_arguments
-                    ), (
-                        f"Host variable '{host_var_name}' not found in "
-                        f"'{host_module_name}' arg table"
-                    )
-                    physics_arg_sources.append(
-                        ("host", host_var_name, host_module_name)
-                    )
-                else:
-                    physics_arg_sources.append(("block",))
-
-            non_host_args = [
-                (callee_input_names[i], callee_input_types[i])
-                for i, src in enumerate(physics_arg_sources)
-                if src[0] == "block"
-            ]
-
-            # Collect module-level host global stubs (shared across all suites).
-            for i, (_arg_name, _arg_type) in enumerate(
-                zip(callee_input_names, callee_input_types)
-            ):
-                src = physics_arg_sources[i]
-                if src[0] != "host":
-                    continue
-                _, host_var_name, host_module_name = src
-                key = (host_var_name, host_module_name)
-                if key not in seen_host_globals:
-                    seen_host_globals.add(key)
-                    glob = llvm.GlobalOp(
-                        llvm.LLVMArrayType.from_size_and_type(1, i8),
-                        host_var_name,
-                        "external",
-                    )
-                    glob.attributes["module"] = StringAttr(host_module_name)
-                    all_host_global_ops.append(glob)
-
-            per_suite.append(
-                {
-                    "suite_name": suite_name,
-                    "suite_part": suite_part,
-                    "suite_callee": suite_callee,
-                    "callee_module": callee_module,
-                    "callee_output_types": callee_output_types,
-                    "callee_input_types": callee_input_types,
-                    "callee_input_names": callee_input_names,
-                    "physics_arg_sources": physics_arg_sources,
-                    "non_host_args": non_host_args,
-                    "scheme_names": scheme_names,
-                }
-            )
-
-        # ── Union of non-host args across all suites (ordered by first appearance) ──
-        union_non_host_args: dict = {}
-        for info in per_suite:
-            for arg_name, arg_type in info["non_host_args"]:
-                if arg_name not in union_non_host_args:
-                    union_non_host_args[arg_name] = arg_type
-
-        n_non_host = len(union_non_host_args)
-        all_block_types = (
-            [suite_name_type, suite_part_type]
-            + list(union_non_host_args.values())
-            + [errmsg_type, errflg_type]
-        )
-        new_block = Block(arg_types=all_block_types)
-
-        suite_name_arg = new_block.args[0]
-        suite_name_arg.name_hint = "suite_name"
-        suite_part_arg = new_block.args[1]
-        suite_part_arg.name_hint = "suite_part"
-
-        block_arg_map = {}
-        for i, arg_name in enumerate(union_non_host_args):
-            ba = new_block.args[2 + i]
-            ba.name_hint = arg_name
-            block_arg_map[arg_name] = ba
-
-        errmsg_arg = new_block.args[2 + n_non_host]
-        errmsg_arg.name_hint = "errmsg"
-        errflg_arg = new_block.args[2 + n_non_host + 1]
-        errflg_arg.name_hint = "errflg"
-
-        # ── Main block setup ───────────────────────────────────────────────────
-        err_const = arith.ConstantOp.from_int_and_width(0, 32)
-        store_errflg = memref.StoreOp.get(err_const, errflg_arg, [])
-
-        trim_suite_name = TrimOp(suite_name_arg)
-
-        # Innermost else: no suite matched
-        write_suite_name_err = WriteErrMsgOp(
-            errmsg_arg, trim_suite_name.res, "No suite named ", "found"
-        )
-        one_outer_err = arith.ConstantOp.from_int_and_width(1, 32)
-        store_outer_err = memref.StoreOp.get(one_outer_err, errflg_arg, [])
-
-        # ── Build nested if/else chain from inside out ─────────────────────────
-        current_false_ops = [
-            write_suite_name_err,
-            one_outer_err,
-            store_outer_err,
-            scf.YieldOp(),
-        ]
         all_decls = []
-
-        for info in reversed(per_suite):
-            suite_name = info["suite_name"]
-            suite_part = info["suite_part"]
-            suite_callee = info["suite_callee"]
-            callee_module = info["callee_module"]
-            callee_output_types = info["callee_output_types"]
-            callee_input_types = info["callee_input_types"]
-            callee_input_names = info["callee_input_names"]
-            physics_arg_sources = info["physics_arg_sources"]
-
-            # ── HostVarRefOps for this suite (placed inside the suite's true branch) ──
-            host_var_ref_ops = []
-            host_var_ref_results = {}
-            host_name_to_ref_result = {}
-
-            for i, (arg_name, arg_type) in enumerate(
-                zip(callee_input_names, callee_input_types)
-            ):
-                src = physics_arg_sources[i]
-                if src[0] != "host":
-                    continue
-                _, host_var_name, host_module_name = src
-                ref_op = HostVarRefOp(host_var_name, host_module_name, arg_type)
-                host_var_ref_ops.append(ref_op)
-                host_var_ref_results[arg_name] = ref_op.res
-                host_name_to_ref_result[host_var_name] = ref_op.res
-
-            # ── ArraySectionOps for this suite ────────────────────────────────
-            array_section_pre_ops = []
-            array_section_extra_ops = []
-            array_section_main_ops = []
-            one_const_for_sections = None
-
-            for i, (arg_name, arg_type) in enumerate(
-                zip(callee_input_names, callee_input_types)
-            ):
-                src = physics_arg_sources[i]
-                if src[0] != "host":
-                    continue
-                _, host_var_name, host_module_name = src
-
-                try:
-                    mod_arg_table = meta_data[host_module_name].getArgTable(
-                        host_module_name
-                    )
-                    host_var_desc = mod_arg_table.getFunctionArgument(host_var_name)
-                except (KeyError, AssertionError):
-                    continue
-
-                if not host_var_desc.hasAttr("dim_names"):
-                    continue
-                dim_names_list = host_var_desc.getAttr("dim_names")
-                if not dim_names_list or dim_names_list[0] != "horizontal_dimension":
-                    continue
-
-                if "col_start" not in block_arg_map or "col_end" not in block_arg_map:
-                    continue
-
-                lowers = [block_arg_map["col_start"]]
-                uppers = [block_arg_map["col_end"]]
-
-                valid = True
-                for dim_std_name in dim_names_list[1:]:
-                    if dim_std_name not in host_var_map:
-                        valid = False
-                        break
-                    dim_var_name, dim_module_name = host_var_map[dim_std_name]
-
-                    if dim_var_name in host_name_to_ref_result:
-                        dim_upper_ref = host_name_to_ref_result[dim_var_name]
-                    else:
-                        dim_ref_op = HostVarRefOp(
-                            dim_var_name,
-                            dim_module_name,
-                            TypeConversions.getBaseType("integer"),
-                        )
-                        array_section_extra_ops.append(dim_ref_op)
-                        host_name_to_ref_result[dim_var_name] = dim_ref_op.res
-                        dim_upper_ref = dim_ref_op.res
-
-                        key = (dim_var_name, dim_module_name)
-                        if key not in seen_host_globals:
-                            seen_host_globals.add(key)
-                            dim_glob = llvm.GlobalOp(
-                                llvm.LLVMArrayType.from_size_and_type(1, i8),
-                                dim_var_name,
-                                "external",
-                            )
-                            dim_glob.attributes["module"] = StringAttr(dim_module_name)
-                            all_host_global_ops.append(dim_glob)
-
-                    if one_const_for_sections is None:
-                        one_const_for_sections = arith.ConstantOp.from_int_and_width(
-                            1, 32
-                        )
-                        array_section_pre_ops.append(one_const_for_sections)
-
-                    lowers.append(one_const_for_sections.result)
-                    uppers.append(dim_upper_ref)
-
-                if not valid or len(lowers) < 2:
-                    continue
-
-                section = ArraySectionOp(
-                    host_var_ref_results[arg_name],
-                    lowers,
-                    uppers,
+        dynamic_locals: dict = {}
+        for suite_name, parts in reversed(suite_entries):
+            if has_parts:
+                trim_suite_part = TrimOp(suite_part_arg)
+                write_part_err = WriteErrMsgOp(
+                    errmsg_value,
+                    trim_suite_part.res,
+                    "No suite part named ",
+                    f" found in suite {suite_name}",
                 )
-                array_section_main_ops.append(section)
-                host_var_ref_results[arg_name] = section.res
+                one_part_err = arith.ConstantOp.from_int_and_width(1, 32)
+                store_part_err = memref.StoreOp.get(one_part_err, errflg_value, [])
+                part_false_ops = [
+                    write_part_err,
+                    one_part_err,
+                    store_part_err,
+                    scf.YieldOp(),
+                ]
+                for part_name, callee in reversed(parts):
+                    call_ops, decl, dynamic = self._build_part_call(
+                        callee, suite_name, block_args, control, True, ctx
+                    )
+                    all_decls.append(decl)
+                    dynamic_locals.update(dict.fromkeys(dynamic))
+                    part_eq = StrCmpOp(trim_suite_part.res, literal=part_name)
+                    part_if = scf.IfOp(
+                        part_eq.res,
+                        [],
+                        [*call_ops, scf.YieldOp()],
+                        part_false_ops,
+                    )
+                    part_false_ops = [part_eq, part_if, scf.YieldOp()]
+                true_ops = [trim_suite_part, *part_false_ops]
+            else:
+                ((_, callee),) = parts
+                call_ops, decl, dynamic = self._build_part_call(
+                    callee, suite_name, block_args, control, False, ctx
+                )
+                all_decls.append(decl)
+                dynamic_locals.update(dict.fromkeys(dynamic))
+                true_ops = [*call_ops, scf.YieldOp()]
 
-            array_section_ops = (
-                array_section_pre_ops + array_section_extra_ops + array_section_main_ops
-            )
-
-            # ── Build call args in callee order ───────────────────────────────
-            call_args = []
-            for i, arg_name in enumerate(callee_input_names):
-                if physics_arg_sources[i][0] == "host":
-                    call_args.append(host_var_ref_results[arg_name])
-                else:
-                    call_args.append(block_arg_map[arg_name])
-
-            # ── Inner if for suite_part ────────────────────────────────────────
-            trim_suite_part = TrimOp(suite_part_arg)
-            suite_part_eq = StrCmpOp(trim_suite_part.res, literal=suite_part)
-
-            call_op = func.CallOp(suite_callee, call_args, callee_output_types)
-
-            copy_ops = []
-            for idx, ret_type in enumerate(callee_output_types):
-                if ret_type == errmsg_type:
-                    copy_ops.append(memref.CopyOp(call_op.results[idx], errmsg_arg))
-                elif ret_type == errflg_type:
-                    copy_ops.append(memref.CopyOp(call_op.results[idx], errflg_arg))
-
-            write_suite_part = WriteErrMsgOp(
-                errmsg_arg,
-                trim_suite_part.res,
-                "No suite part named ",
-                f" found in suite {suite_name}",
-            )
-            one_inner = arith.ConstantOp.from_int_and_width(1, 32)
-            store_errflg_inner = memref.StoreOp.get(one_inner, errflg_arg, [])
-
-            inner_if = scf.IfOp(
-                suite_part_eq.res,
-                [],
-                [call_op] + copy_ops + [scf.YieldOp()],
-                [write_suite_part, one_inner, store_errflg_inner, scf.YieldOp()],
-            )
-
-            # True branch ops for this suite's outer if
-            true_branch_ops = [
-                *host_var_ref_ops,
-                *array_section_ops,
-                trim_suite_part,
-                suite_part_eq,
-                inner_if,
-                scf.YieldOp(),
-            ]
-
-            # Outer if for suite_name
             strcmp_op = StrCmpOp(trim_suite_name.res, literal=suite_name)
-            if_op = scf.IfOp(
-                strcmp_op.res,
-                [],
-                true_branch_ops,
-                current_false_ops,
-            )
+            if_op = scf.IfOp(strcmp_op.res, [], true_ops, current_false_ops)
             current_false_ops = [strcmp_op, if_op, scf.YieldOp()]
 
-            decl = func.FuncOp.external(
-                suite_callee, callee_input_types, callee_output_types
-            )
-            decl.attributes["module"] = StringAttr(callee_module)
-            all_decls.append(decl)
-
-        # Strip trailing YieldOp — main block ends with ReturnOp
+        # Strip trailing YieldOp: the main block ends with ReturnOp
         main_chain_ops = current_false_ops[:-1]
-
-        ret_op = func.ReturnOp(errmsg_arg, errflg_arg)
 
         new_block.add_ops(
             [
+                *control_ops,
                 err_const,
                 store_errflg,
                 trim_suite_name,
                 *main_chain_ops,
-                ret_op,
+                func.ReturnOp(),
             ]
         )
 
         body = Region()
         body.add_block(new_block)
 
-        fn_type = builtin.FunctionType.from_lists(
-            all_block_types,
-            [errmsg_type, errflg_type],
-        )
+        fn_type = builtin.FunctionType.from_lists(all_block_types, [])
         cap_fn = func.FuncOp(fn_name, fn_type, body, visibility="public")
-        return cap_fn, all_decls, all_host_global_ops
+        loop_bounds = {LOOP_BEGIN, LOOP_END}
+        cap_fn.attributes["ftn_arg_intents"] = ArrayAttr(
+            [
+                *[StringAttr("in") for _ in leading_types],
+                *[
+                    StringAttr("in" if dummy[2] <= loop_bounds else "inout")
+                    for dummy in control_dummies
+                ],
+                *[StringAttr(intent) for intent in union_intents.values()],
+            ]
+        )
+        cap_fn.attributes["ftn_allocatable_args"] = ArrayAttr(
+            [StringAttr(name) for name in sorted(allocatable_args)]
+        )
+        if dynamic_locals:
+            local_decls = [
+                f"type({ccpp_consts.CONSTITUENT_TYPE}), allocatable :: {name}(:)"
+                for name in dynamic_locals
+            ]
+            local_decls += [
+                "integer :: ccpp_num_dyn_consts",
+                "integer :: ccpp_dyn_const_index",
+            ]
+            cap_fn.attributes["ftn_local_decls"] = ArrayAttr(
+                [StringAttr(decl) for decl in local_decls]
+            )
+        return cap_fn, all_decls
 
     def _generate_suite_part_list_fn(
         self,
@@ -630,9 +469,14 @@ class CCPPCAP(ModulePass):
 
         part_global_ops = []
         part_global_names: dict = {}
+        suite_names = {suite_name for suite_name, _ in suite_part_entries}
         for pn in all_part_names:
             str_global_name = f"str_{pn}"
             arr_type = llvm.LLVMArrayType.from_size_and_type(len(pn), i8)
+            part_global_names[pn] = (str_global_name, arr_type)
+            if pn in suite_names:
+                # Already declared for ccpp_physics_suite_list
+                continue
             part_global_ops.append(
                 llvm.GlobalOp(
                     arr_type,
@@ -642,7 +486,6 @@ class CCPPCAP(ModulePass):
                     value=StringAttr(pn),
                 )
             )
-            part_global_names[pn] = (str_global_name, arr_type)
 
         new_block = Block(arg_types=[suite_name_type, allocatable_type])
         new_block.args[0].name_hint = "suite_name"
@@ -726,7 +569,9 @@ class CCPPCAP(ModulePass):
         )
         return suite_part_list_fn, part_global_ops
 
-    def _generate_ccpp_cap_module(self, suite_descriptions, meta_data, public_fns):
+    def _generate_ccpp_cap_module(
+        self, suite_descriptions, meta_data, public_fns, arg_properties
+    ):
         """Build a single combined CCPP cap ModuleOp for all suites.
 
         Generates one module whose lifecycle subroutines use nested if/else chains
@@ -753,86 +598,81 @@ class CCPPCAP(ModulePass):
         errmsg_type = memref.MemRefType(char_base, [512])
         errflg_type = memref.MemRefType(int_base, [])
 
-        common = dict(
-            suite_name_type=suite_name_type,
-            errmsg_type=errmsg_type,
-            errflg_type=errflg_type,
-            char_base=char_base,
-            int_base=int_base,
-            public_fns=public_fns,
-        )
-
-        lifecycle_specs = [
-            ("_ccpp_physics_initialize", "_init", "_suite_initialize", None),
-            ("_ccpp_physics_finalize", "_finalize", "_suite_finalize", None),
-            ("_ccpp_physics_timestep_initial", None, "_suite_timestep_initial", None),
-            ("_ccpp_physics_timestep_final", None, "_suite_timestep_final", None),
-            ("_ccpp_physics_run", None, "_suite_physics", "physics"),
+        control_dummies, control_expressions = self._control_dummies(meta_data)
+        host = host_variables(meta_data)
+        suite_consts = {
+            suite_name: ccpp_consts.suite_constituents(suite_desc, meta_data, host)
+            for suite_name, suite_desc in suite_descriptions.items()
+        }
+        suite_dynamic = {
+            suite_name: ccpp_consts.dynamic_constituents(suite_desc, meta_data)
+            for suite_name, suite_desc in suite_descriptions.items()
+        }
+        constituent_suites = [
+            suite_name
+            for suite_name in suite_descriptions
+            if suite_consts[suite_name] or suite_dynamic[suite_name]
         ]
+        constituents = (
+            ccpp_consts.ConstituentMap(camel_name, suite_consts)
+            if constituent_suites
+            else None
+        )
+        ctx = {
+            "constituents": constituents,
+            "host": host,
+            "host_imports": {},
+            "suite_name_type": suite_name_type,
+            "errmsg_type": errmsg_type,
+            "errflg_type": errflg_type,
+            "public_fns": public_fns,
+            "arg_properties": arg_properties,
+            "control_dummies": control_dummies,
+            "control_expressions": control_expressions,
+        }
 
         all_globals: list = []
         all_definitions: list = []
         all_declarations: list = []
 
-        for fn_suffix, table_postfix, callee_suffix, suite_part in lifecycle_specs:
-            if suite_part is not None:
-                # Run function: collect per-suite run entries
-                suite_run_entries = []
-                for suite_name, suite_desc in suite_descriptions.items():
-                    suite_callee = suite_name + callee_suffix
-                    if suite_callee not in public_fns:
-                        continue
-                    scheme_names = [
-                        scheme.attributes["name"]
-                        for group in suite_desc
-                        for scheme in group
-                    ]
-                    suite_run_entries.append(
-                        (suite_name, suite_part, suite_callee, scheme_names)
-                    )
+        lifecycle_specs = [
+            ("_ccpp_physics_register", "_suite_register"),
+            ("_ccpp_physics_initialize", "_suite_initialize"),
+            ("_ccpp_physics_finalize", "_suite_finalize"),
+            ("_ccpp_physics_timestep_initial", "_suite_timestep_initial"),
+            ("_ccpp_physics_timestep_final", "_suite_timestep_final"),
+        ]
 
-                if not suite_run_entries:
-                    continue
-
-                cap_fn, decls, host_global_ops = self._generate_run_fn(
-                    fn_name=camel_name + fn_suffix,
-                    suite_run_entries=suite_run_entries,
-                    meta_data=meta_data,
-                    **common,
-                )
-                all_globals.extend(host_global_ops)
-                all_declarations.extend(decls)
-            else:
-                # Lifecycle function: collect per-suite callee info
-                suite_entries = []
-                for suite_name, suite_desc in suite_descriptions.items():
-                    suite_callee = suite_name + callee_suffix
-                    if suite_callee not in public_fns:
-                        continue
-                    scheme_names = [
-                        scheme.attributes["name"]
-                        for group in suite_desc
-                        for scheme in group
-                    ]
-                    if table_postfix is not None:
-                        call_ret_types = self._get_suite_lifecycle_return_types(
-                            scheme_names, meta_data, table_postfix
-                        )
-                    else:
-                        _, call_ret_types, _, _ = public_fns[suite_callee]
-                    suite_entries.append((suite_name, suite_callee, call_ret_types))
-
-                if not suite_entries:
-                    continue
-
-                cap_fn, decls = self._generate_lifecycle_fn(
-                    fn_name=camel_name + fn_suffix,
-                    suite_entries=suite_entries,
-                    **common,
-                )
-                all_declarations.extend(decls)
-
+        for fn_suffix, callee_suffix in lifecycle_specs:
+            suite_entries = [
+                (suite_name, [(None, suite_name + callee_suffix)])
+                for suite_name in suite_descriptions
+            ]
+            cap_fn, decls = self._generate_dispatch_fn(
+                camel_name + fn_suffix, suite_entries, False, ctx
+            )
             all_definitions.append(cap_fn)
+            all_declarations.extend(decls)
+
+        # The run phase has one suite cap subroutine per group
+        run_entries = [
+            (
+                suite_name,
+                [
+                    (
+                        group.attributes["name"],
+                        f"{suite_name}_suite_{group.attributes['name']}",
+                    )
+                    for group in suite_desc
+                ],
+            )
+            for suite_name, suite_desc in suite_descriptions.items()
+        ]
+        cap_fn, decls = self._generate_dispatch_fn(
+            camel_name + "_ccpp_physics_run", run_entries, True, ctx
+        )
+        all_definitions.append(cap_fn)
+        all_declarations.extend(decls)
 
         # Generate ccpp_physics_suite_list listing ALL suite names.
         inner_char_type = memref.MemRefType(i8, [DYNAMIC_INDEX])
@@ -882,10 +722,10 @@ class CCPPCAP(ModulePass):
         all_definitions.append(suite_list_fn)
 
         # Generate ccpp_physics_suite_part_list for all suites.
-        part_names = list(
-            dict.fromkeys(sp for _, _, _, sp in lifecycle_specs if sp is not None)
-        )
-        suite_part_entries = [(sn, part_names) for sn in all_suite_names]
+        suite_part_entries = [
+            (sn, [group.attributes["name"] for group in suite_descriptions[sn]])
+            for sn in all_suite_names
+        ]
 
         suite_part_list_fn, part_global_ops = self._generate_suite_part_list_fn(
             suite_part_entries=suite_part_entries,
@@ -900,12 +740,83 @@ class CCPPCAP(ModulePass):
         all_globals.extend(part_global_ops)
         all_definitions.append(suite_part_list_fn)
 
+        framework = {
+            *ccpp_consts.OBJECT_MEMBERS,
+            *(name for names in suite_dynamic.values() for name in names),
+        }
+        required = {
+            suite_name: required_variables(
+                suite_desc,
+                meta_data,
+                host,
+                control_expressions,
+                constituents=set(suite_consts[suite_name]),
+                framework=framework,
+            )
+            for suite_name, suite_desc in suite_descriptions.items()
+        }
+        # Like the CCPP framework, a variable that any suite writes is reported as
+        # an output of every suite that uses it
+        written = {name for _, outputs in required.values() for name in outputs}
+        suite_variable_lists = {}
+        for suite_name, (inputs, outputs) in required.items():
+            outputs = sorted({*outputs, *(set(inputs) & written)})
+            suite_variable_lists[suite_name] = ArrayAttr(
+                [
+                    ArrayAttr([StringAttr(name) for name in inputs]),
+                    ArrayAttr([StringAttr(name) for name in outputs]),
+                ]
+            )
+        all_definitions.append(SuiteVariablesFnOp(DictionaryAttr(suite_variable_lists)))
+
+        if constituents is not None:
+            all_definitions.append(
+                HostConstituentsOp(
+                    camel_name,
+                    ArrayAttr(
+                        [
+                            DictionaryAttr(
+                                {
+                                    "name": StringAttr(suite_name),
+                                    "module": StringAttr(f"{suite_name}_cap"),
+                                    "dynamic": StringAttr(
+                                        "true" if suite_dynamic[suite_name] else ""
+                                    ),
+                                }
+                            )
+                            for suite_name in constituent_suites
+                        ]
+                    ),
+                    ArrayAttr([StringAttr(name) for name in constituents.names]),
+                    *[
+                        self._plain_name(control_expressions[std_name], default)
+                        for std_name, default in (
+                            (ERROR_CODE, "errflg"),
+                            (ERROR_MESSAGE, "errmsg"),
+                        )
+                    ],
+                )
+            )
+        # Imports of the host variables that the host cap passes on
+        for root, module in ctx["host_imports"].items():
+            glob = llvm.GlobalOp(
+                llvm.LLVMArrayType.from_size_and_type(1, i8), root, "external"
+            )
+            glob.attributes["module"] = StringAttr(module)
+            all_globals.append(glob)
+
         module_ops = all_globals + all_definitions + all_declarations
 
-        return builtin.ModuleOp(
+        cap_module = builtin.ModuleOp(
             module_ops,
             sym_name=builtin.StringAttr(mod_name),
         )
+        type_uses = TypeConversions.derived_type_uses(cap_module, meta_data)
+        if type_uses:
+            cap_module.attributes["ftn_type_uses"] = DictionaryAttr(
+                {k: StringAttr(v) for k, v in type_uses.items()}
+            )
+        return cap_module
 
     def apply(self, ctx: Context, op: builtin.ModuleOp) -> None:
         ccpp_mod = self.find_ccpp_module(op.body.block.ops)
@@ -922,10 +833,12 @@ class CCPPCAP(ModulePass):
         suite_descriptions = bsd.schemes
 
         # Collect public functions from suite cap modules already in the IR
-        public_fns = self._collect_public_suite_functions(op.body.block.ops)
+        public_fns, arg_properties = self._collect_public_suite_functions(
+            op.body.block.ops
+        )
 
         # Generate ONE combined CCPP cap module for all suites
         cap_mod = self._generate_ccpp_cap_module(
-            suite_descriptions, meta_data_descriptions, public_fns
+            suite_descriptions, meta_data_descriptions, public_fns, arg_properties
         )
         op.body.block.add_op(cap_mod)

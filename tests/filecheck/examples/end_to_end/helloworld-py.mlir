@@ -10,18 +10,35 @@
 // CHECK-LABEL: // FILE: hello_world_suite_cap.F90
 // CHECK-LABEL: module hello_world_suite_cap
 // CHECK:         use ccpp_kinds
+// CHECK-NEXT:    use hello_scheme, only: hello_scheme_finalize
+// CHECK-NEXT:    use hello_scheme, only: hello_scheme_init
+// CHECK-NEXT:    use hello_scheme, only: hello_scheme_run
+// CHECK-NEXT:    use temp_adjust, only: temp_adjust_finalize
+// CHECK-NEXT:    use temp_adjust, only: temp_adjust_init
+// CHECK-NEXT:    use temp_adjust, only: temp_adjust_run
 // CHECK:         implicit none
 // CHECK-NEXT:    private
 // CHECK:         character(len=16) :: ccpp_suite_state = 'uninitialized'
 // CHECK-NEXT:    character(len=16), parameter :: const_in_time_step = 'in_time_step'
 // CHECK-NEXT:    character(len=16), parameter :: const_initialized = 'initialized'
 // CHECK-NEXT:    character(len=16), parameter :: const_uninitialized = 'uninitialized'
+// CHECK-NEXT:    public :: hello_world_suite_suite_register
 // CHECK-NEXT:    public :: hello_world_suite_suite_initialize
 // CHECK-NEXT:    public :: hello_world_suite_suite_finalize
 // CHECK-NEXT:    public :: hello_world_suite_suite_physics
 // CHECK-NEXT:    public :: hello_world_suite_suite_timestep_initial
 // CHECK-NEXT:    public :: hello_world_suite_suite_timestep_final
 // CHECK:       CONTAINS
+// CHECK-LABEL:   subroutine hello_world_suite_suite_register(errmsg, errflg)
+// CHECK:           character(len=512), intent(out) :: errmsg
+// CHECK-NEXT:      integer, intent(out) :: errflg
+// CHECK:           errflg = 0
+// CHECK-NEXT:      if (.NOT. (const_uninitialized .eq. ccpp_suite_state)) then
+// CHECK-NEXT:        write(errmsg, '(3a)') "Invalid initial CCPP state, '", trim(ccpp_suite_state),              &
+// CHECK-NEXT:          "' in hello_world_suite_register"
+// CHECK-NEXT:        errflg = 1
+// CHECK-NEXT:      end if
+// CHECK-NEXT:    end subroutine hello_world_suite_suite_register
 // CHECK-LABEL:   subroutine hello_world_suite_suite_initialize(errmsg, errflg)
 // CHECK:           character(len=512), intent(out) :: errmsg
 // CHECK-NEXT:      integer, intent(out) :: errflg
@@ -32,10 +49,10 @@
 // CHECK-NEXT:        errflg = 1
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      if (errflg .eq. 0) then
-// CHECK-NEXT:        call hello_scheme_init(errmsg, errflg)
+// CHECK-NEXT:        call hello_scheme_init(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      if (errflg .eq. 0) then
-// CHECK-NEXT:        call temp_adjust_init(errmsg, errflg)
+// CHECK-NEXT:        call temp_adjust_init(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      ccpp_suite_state = const_initialized
 // CHECK-NEXT:    end subroutine hello_world_suite_suite_initialize
@@ -49,10 +66,10 @@
 // CHECK-NEXT:        errflg = 1
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      if (errflg .eq. 0) then
-// CHECK-NEXT:        call hello_scheme_finalize(errmsg, errflg)
+// CHECK-NEXT:        call hello_scheme_finalize(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      if (errflg .eq. 0) then
-// CHECK-NEXT:        call temp_adjust_finalize(errmsg, errflg)
+// CHECK-NEXT:        call temp_adjust_finalize(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      ccpp_suite_state = const_uninitialized
 // CHECK-NEXT:    end subroutine hello_world_suite_suite_finalize
@@ -67,25 +84,26 @@
 // CHECK-NEXT:      real(kind=kind_phys), intent(inout) :: temp_layer(:, :)
 // CHECK-NEXT:      character(len=512), intent(out) :: errmsg
 // CHECK-NEXT:      integer, intent(out) :: errflg
-// CHECK-NEXT:      integer :: ncol
+// CHECK-NEXT:      integer :: ccpp_ncol
 // CHECK:           errflg = 0
-// CHECK-NEXT:      ncol = col_end - col_start + 1
+// CHECK-NEXT:      ccpp_ncol = col_end - col_start + 1
 // CHECK-NEXT:      if (.NOT. (const_in_time_step .eq. ccpp_suite_state)) then
 // CHECK-NEXT:        write(errmsg, '(3a)') "Invalid initial CCPP state, '", trim(ccpp_suite_state),              &
 // CHECK-NEXT:          "' in hello_world_suite_physics"
 // CHECK-NEXT:        errflg = 1
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      if (errflg .eq. 0) then
-// CHECK-NEXT:        call hello_scheme_run(ncol, lev, ilev, timestep, temp_level, temp_level, temp_layer,        &
-// CHECK-NEXT:          errmsg, errflg)
+// CHECK-NEXT:        call hello_scheme_run(ncol=ccpp_ncol, lev=lev, ilev=ilev, timestep=timestep,                &
+// CHECK-NEXT:          temp_level=temp_level, temp_layer=temp_layer, errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      if (errflg .eq. 0) then
-// CHECK-NEXT:        call temp_adjust_run(ncol, lev, temp_layer, timestep, temp_layer, errmsg, errflg)
+// CHECK-NEXT:        call temp_adjust_run(nbox=ccpp_ncol, lev=lev, temp_layer=temp_layer, timestep=timestep,     &
+// CHECK-NEXT:          errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      end if
 // CHECK-NEXT:    end subroutine hello_world_suite_suite_physics
-// CHECK-LABEL:   subroutine hello_world_suite_suite_timestep_initial(errflg, errmsg)
-// CHECK:           integer, intent(out) :: errflg
-// CHECK-NEXT:      character(len=512), intent(out) :: errmsg
+// CHECK-LABEL:   subroutine hello_world_suite_suite_timestep_initial(errmsg, errflg)
+// CHECK:           character(len=512), intent(out) :: errmsg
+// CHECK-NEXT:      integer, intent(out) :: errflg
 // CHECK:           errflg = 0
 // CHECK-NEXT:      if (.NOT. (const_initialized .eq. ccpp_suite_state)) then
 // CHECK-NEXT:        write(errmsg, '(3a)') "Invalid initial CCPP state, '", trim(ccpp_suite_state),              &
@@ -94,9 +112,9 @@
 // CHECK-NEXT:      end if
 // CHECK-NEXT:      ccpp_suite_state = const_in_time_step
 // CHECK-NEXT:    end subroutine hello_world_suite_suite_timestep_initial
-// CHECK-LABEL:   subroutine hello_world_suite_suite_timestep_final(errflg, errmsg)
-// CHECK:           integer, intent(out) :: errflg
-// CHECK-NEXT:      character(len=512), intent(out) :: errmsg
+// CHECK-LABEL:   subroutine hello_world_suite_suite_timestep_final(errmsg, errflg)
+// CHECK:           character(len=512), intent(out) :: errmsg
+// CHECK-NEXT:      integer, intent(out) :: errflg
 // CHECK:           errflg = 0
 // CHECK-NEXT:      if (.NOT. (const_in_time_step .eq. ccpp_suite_state)) then
 // CHECK-NEXT:        write(errmsg, '(3a)') "Invalid initial CCPP state, '", trim(ccpp_suite_state),              &
@@ -113,12 +131,14 @@
 // CHECK-NEXT:    use hello_world_suite_cap, only: hello_world_suite_suite_finalize
 // CHECK-NEXT:    use hello_world_suite_cap, only: hello_world_suite_suite_initialize
 // CHECK-NEXT:    use hello_world_suite_cap, only: hello_world_suite_suite_physics
+// CHECK-NEXT:    use hello_world_suite_cap, only: hello_world_suite_suite_register
 // CHECK-NEXT:    use hello_world_suite_cap, only: hello_world_suite_suite_timestep_final
 // CHECK-NEXT:    use hello_world_suite_cap, only: hello_world_suite_suite_timestep_initial
 // CHECK:         implicit none
 // CHECK-NEXT:    private
 // CHECK:         character(len=17), parameter :: str_hello_world_suite = 'hello_world_suite'
 // CHECK-NEXT:    character(len=7), parameter :: str_physics = 'physics'
+// CHECK-NEXT:    public :: HelloWorld_ccpp_physics_register
 // CHECK-NEXT:    public :: HelloWorld_ccpp_physics_initialize
 // CHECK-NEXT:    public :: HelloWorld_ccpp_physics_finalize
 // CHECK-NEXT:    public :: HelloWorld_ccpp_physics_timestep_initial
@@ -126,14 +146,27 @@
 // CHECK-NEXT:    public :: HelloWorld_ccpp_physics_run
 // CHECK-NEXT:    public :: ccpp_physics_suite_list
 // CHECK-NEXT:    public :: ccpp_physics_suite_part_list
+// CHECK-NEXT:    public :: ccpp_physics_suite_variables
 // CHECK:       CONTAINS
-// CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_initialize(suite_name, errmsg, errflg)
+// CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_register(suite_name, errmsg, errflg)
 // CHECK:           character(len=*), intent(in) :: suite_name
-// CHECK-NEXT:      character(len=512), intent(out) :: errmsg
-// CHECK-NEXT:      integer, intent(out) :: errflg
+// CHECK-NEXT:      character(len=512), intent(inout) :: errmsg
+// CHECK-NEXT:      integer, intent(inout) :: errflg
 // CHECK:           errflg = 0
 // CHECK-NEXT:      if (trim(suite_name) .eq. 'hello_world_suite') then
-// CHECK-NEXT:        call hello_world_suite_suite_initialize(errmsg, errflg)
+// CHECK-NEXT:        call hello_world_suite_suite_register(errmsg=errmsg, errflg=errflg)
+// CHECK-NEXT:      else
+// CHECK-NEXT:        write(errmsg, '(3a)') "No suite named ", trim(suite_name), "found"
+// CHECK-NEXT:        errflg = 1
+// CHECK-NEXT:      end if
+// CHECK-NEXT:    end subroutine HelloWorld_ccpp_physics_register
+// CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_initialize(suite_name, errmsg, errflg)
+// CHECK:           character(len=*), intent(in) :: suite_name
+// CHECK-NEXT:      character(len=512), intent(inout) :: errmsg
+// CHECK-NEXT:      integer, intent(inout) :: errflg
+// CHECK:           errflg = 0
+// CHECK-NEXT:      if (trim(suite_name) .eq. 'hello_world_suite') then
+// CHECK-NEXT:        call hello_world_suite_suite_initialize(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      else
 // CHECK-NEXT:        write(errmsg, '(3a)') "No suite named ", trim(suite_name), "found"
 // CHECK-NEXT:        errflg = 1
@@ -141,11 +174,11 @@
 // CHECK-NEXT:    end subroutine HelloWorld_ccpp_physics_initialize
 // CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_finalize(suite_name, errmsg, errflg)
 // CHECK:           character(len=*), intent(in) :: suite_name
-// CHECK-NEXT:      character(len=512), intent(out) :: errmsg
-// CHECK-NEXT:      integer, intent(out) :: errflg
+// CHECK-NEXT:      character(len=512), intent(inout) :: errmsg
+// CHECK-NEXT:      integer, intent(inout) :: errflg
 // CHECK:           errflg = 0
 // CHECK-NEXT:      if (trim(suite_name) .eq. 'hello_world_suite') then
-// CHECK-NEXT:        call hello_world_suite_suite_finalize(errmsg, errflg)
+// CHECK-NEXT:        call hello_world_suite_suite_finalize(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      else
 // CHECK-NEXT:        write(errmsg, '(3a)') "No suite named ", trim(suite_name), "found"
 // CHECK-NEXT:        errflg = 1
@@ -153,11 +186,11 @@
 // CHECK-NEXT:    end subroutine HelloWorld_ccpp_physics_finalize
 // CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_timestep_initial(suite_name, errmsg, errflg)
 // CHECK:           character(len=*), intent(in) :: suite_name
-// CHECK-NEXT:      character(len=512), intent(out) :: errmsg
-// CHECK-NEXT:      integer, intent(out) :: errflg
+// CHECK-NEXT:      character(len=512), intent(inout) :: errmsg
+// CHECK-NEXT:      integer, intent(inout) :: errflg
 // CHECK:           errflg = 0
 // CHECK-NEXT:      if (trim(suite_name) .eq. 'hello_world_suite') then
-// CHECK-NEXT:        call hello_world_suite_suite_timestep_initial(errflg, errmsg)
+// CHECK-NEXT:        call hello_world_suite_suite_timestep_initial(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      else
 // CHECK-NEXT:        write(errmsg, '(3a)') "No suite named ", trim(suite_name), "found"
 // CHECK-NEXT:        errflg = 1
@@ -165,34 +198,35 @@
 // CHECK-NEXT:    end subroutine HelloWorld_ccpp_physics_timestep_initial
 // CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_timestep_final(suite_name, errmsg, errflg)
 // CHECK:           character(len=*), intent(in) :: suite_name
-// CHECK-NEXT:      character(len=512), intent(out) :: errmsg
-// CHECK-NEXT:      integer, intent(out) :: errflg
+// CHECK-NEXT:      character(len=512), intent(inout) :: errmsg
+// CHECK-NEXT:      integer, intent(inout) :: errflg
 // CHECK:           errflg = 0
 // CHECK-NEXT:      if (trim(suite_name) .eq. 'hello_world_suite') then
-// CHECK-NEXT:        call hello_world_suite_suite_timestep_final(errflg, errmsg)
+// CHECK-NEXT:        call hello_world_suite_suite_timestep_final(errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:      else
 // CHECK-NEXT:        write(errmsg, '(3a)') "No suite named ", trim(suite_name), "found"
 // CHECK-NEXT:        errflg = 1
 // CHECK-NEXT:      end if
 // CHECK-NEXT:    end subroutine HelloWorld_ccpp_physics_timestep_final
-// CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_run(suite_name, suite_part, col_start, col_end, lev, ilev,   &
-// CHECK:           timestep, temp_level, temp_layer, errmsg, errflg)
+// CHECK-LABEL:   subroutine HelloWorld_ccpp_physics_run(suite_name, suite_part, col_start, col_end, errmsg,      &
+// CHECK:           errflg, lev, ilev, timestep, temp_level, temp_layer)
 // CHECK-NEXT:      character(len=*), intent(in) :: suite_name
 // CHECK-NEXT:      character(len=*), intent(in) :: suite_part
 // CHECK-NEXT:      integer, intent(in) :: col_start
 // CHECK-NEXT:      integer, intent(in) :: col_end
+// CHECK-NEXT:      character(len=512), intent(inout) :: errmsg
+// CHECK-NEXT:      integer, intent(inout) :: errflg
 // CHECK-NEXT:      integer, intent(in) :: lev
 // CHECK-NEXT:      integer, intent(in) :: ilev
 // CHECK-NEXT:      real(kind=kind_phys), intent(in) :: timestep
 // CHECK-NEXT:      real(kind=kind_phys), intent(inout) :: temp_level(:, :)
 // CHECK-NEXT:      real(kind=kind_phys), intent(inout) :: temp_layer(:, :)
-// CHECK-NEXT:      character(len=512), intent(inout) :: errmsg
-// CHECK-NEXT:      integer, intent(inout) :: errflg
 // CHECK:           errflg = 0
 // CHECK-NEXT:      if (trim(suite_name) .eq. 'hello_world_suite') then
 // CHECK-NEXT:        if (trim(suite_part) .eq. 'physics') then
-// CHECK-NEXT:          call hello_world_suite_suite_physics(col_start, col_end, lev, ilev, timestep, temp_level, &
-// CHECK-NEXT:            temp_layer, errmsg, errflg)
+// CHECK-NEXT:          call hello_world_suite_suite_physics(col_start=col_start, col_end=col_end, lev=lev,       &
+// CHECK-NEXT:            ilev=ilev, timestep=timestep, temp_level=temp_level, temp_layer=temp_layer,             &
+// CHECK-NEXT:            errmsg=errmsg, errflg=errflg)
 // CHECK-NEXT:        else
 // CHECK-NEXT:          write(errmsg, '(3a)') "No suite part named ", trim(suite_part),                           &
 // CHECK-NEXT:            " found in suite hello_world_suite"
@@ -222,6 +256,49 @@
 // CHECK-NEXT:        errflg = 1
 // CHECK-NEXT:      end if
 // CHECK-NEXT:    end subroutine ccpp_physics_suite_part_list
+// CHECK-LABEL:   subroutine ccpp_physics_suite_variables(suite_name, variable_list, errmsg, errflg, input_vars,  &
+// CHECK:           output_vars, struct_elements)
+// CHECK-NEXT:      character(len=*), intent(in) :: suite_name
+// CHECK-NEXT:      character(len=*), allocatable, intent(out) :: variable_list(:)
+// CHECK-NEXT:      character(len=512), intent(out) :: errmsg
+// CHECK-NEXT:      integer, intent(out) :: errflg
+// CHECK-NEXT:      logical, optional, intent(in) :: input_vars
+// CHECK-NEXT:      logical, optional, intent(in) :: output_vars
+// CHECK-NEXT:      logical, optional, intent(in) :: struct_elements
+// CHECK-NEXT:      logical :: use_inputs, use_outputs
+// CHECK-NEXT:      integer :: index
+// CHECK:           errflg = 0
+// CHECK-NEXT:      errmsg = ''
+// CHECK-NEXT:      use_inputs = .true.
+// CHECK-NEXT:      if (present(input_vars)) use_inputs = input_vars
+// CHECK-NEXT:      use_outputs = .true.
+// CHECK-NEXT:      if (present(output_vars)) use_outputs = output_vars
+// CHECK-NEXT:      if (trim(suite_name) == 'hello_world_suite') then
+// CHECK-NEXT:        if (use_inputs .and. use_outputs) then
+// CHECK-NEXT:          allocate(variable_list(2))
+// CHECK-NEXT:        else if (use_inputs) then
+// CHECK-NEXT:          allocate(variable_list(0))
+// CHECK-NEXT:        else if (use_outputs) then
+// CHECK-NEXT:          allocate(variable_list(2))
+// CHECK-NEXT:        else
+// CHECK-NEXT:          allocate(variable_list(0))
+// CHECK-NEXT:        end if
+// CHECK-NEXT:        index = 0
+// CHECK-NEXT:        if (use_inputs .or. use_outputs) then
+// CHECK-NEXT:        end if
+// CHECK-NEXT:        if (use_inputs) then
+// CHECK-NEXT:        end if
+// CHECK-NEXT:        if (use_outputs) then
+// CHECK-NEXT:          index = index + 1
+// CHECK-NEXT:          variable_list(index) = 'ccpp_error_code'
+// CHECK-NEXT:          index = index + 1
+// CHECK-NEXT:          variable_list(index) = 'ccpp_error_message'
+// CHECK-NEXT:        end if
+// CHECK-NEXT:      else
+// CHECK-NEXT:        write(errmsg, '(3a)') 'No suite named ', trim(suite_name), ' found'
+// CHECK-NEXT:        errflg = 1
+// CHECK-NEXT:      end if
+// CHECK-NEXT:    end subroutine ccpp_physics_suite_variables
 // CHECK-NEXT:  end module hello_world_ccpp_cap
 // CHECK:       // -----
 // CHECK-LABEL: // FILE: ccpp_kinds.F90
